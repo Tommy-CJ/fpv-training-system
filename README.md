@@ -1,4 +1,3 @@
-````md
 # FPV Training Monitor System
 
 一个基于 Web Serial + WebSocket + SQLite 的 FPV / 无人机训练监测系统。
@@ -9,15 +8,15 @@
 
 # 项目特点
 
-- 浏览器直接连接训练硬件（Web Serial）
-- 最多支持 16 路 ELRS / CRSF 接收机
-- 教练端实时低延迟监测
-- 观众端无需硬件即可实时观看
-- SQLite 持久化训练历史
-- 自动恢复训练状态
-- 实时飞行条带与统计
-- 多飞手 / 多接收机管理
-- 面向未来 AI 分析与语音教练扩展
+* 浏览器直接连接训练硬件（Web Serial）
+* 最多支持 16 路 ELRS / CRSF 接收机
+* 教练端实时低延迟监测
+* 观众端无需硬件即可实时观看
+* SQLite 持久化训练历史
+* 自动恢复训练状态
+* 实时飞行条带与统计
+* 多飞手 / 多接收机管理
+* 面向未来 AI 分析与语音教练扩展
 
 ---
 
@@ -27,18 +26,18 @@
 
 支持：
 
-- 飞手库
-- Rates / Profile
-- 通道配置
-- 模式范围配置
-- Arm / Turtle / Mode 自定义
+* 飞手库
+* Rates / Profile
+* 通道配置
+* 模式范围配置
+* Arm / Turtle / Mode 自定义
 
 默认：
 
-- CH5：Arm
-- CH6：Mode
-- CH7：Turtle
-- CH8：预留
+* CH5：Arm
+* CH6：Mode
+* CH7：Turtle
+* CH8：预留
 
 ---
 
@@ -46,26 +45,26 @@
 
 实时显示：
 
-- 摇杆位置
-- 油门变化
-- 接收机在线状态
-- RSSI / LQ
-- 飞行状态
-- Turtle 状态
-- 飞行条带时间轴
+* 摇杆位置
+* 油门变化
+* 接收机在线状态
+* RSSI / LQ
+* 飞行状态
+* Turtle 状态
+* 飞行条带时间轴
 
 训练状态自动识别：
 
-- Flying
-- Idle
-- Turtle
+* Flying
+* Idle
+* Turtle
 
 支持：
 
-- 多飞手同时监测
-- 实时波形
-- 时间窗口缩放
-- 历史条带恢复
+* 多飞手同时监测
+* 实时波形
+* 时间窗口缩放
+* 历史条带恢复
 
 ---
 
@@ -73,12 +72,11 @@
 
 浏览器直接连接 MCU：
 
-- 无需安装驱动程序
-- 无需本地客户端
-- 自动识别训练 Hub
-- 自动恢复连接
-- USB 拔插自动恢复
-
+* 无需安装驱动程序
+* 无需本地客户端
+* 自动识别训练 Hub
+* 自动恢复连接
+* USB 拔插自动恢复
 
 ---
 
@@ -150,7 +148,7 @@
 
 主要页面：
 
-```text
+```
 src/pages/EventPage.jsx
 src/pages/MonitorPage.jsx
 src/pages/PilotLibraryPage.jsx
@@ -172,7 +170,7 @@ src/pages/HistoryPage.jsx
 
 ## 数据库
 
-```text
+```
 data/training.db
 ```
 
@@ -201,7 +199,7 @@ data/training.db
 
 # 系统架构
 
-```text
+```
 MCU Training Hub
         ↓ USB CDC
 Web Serial (Coach Browser)
@@ -254,7 +252,7 @@ WebSocket Subscribers
 
 未来目标：
 
-```text
+```
 “像真人教练一样分析训练过程”
 ```
 
@@ -272,7 +270,7 @@ WebSocket Subscribers
 
 例如：
 
-```text
+```
 “你已经 8 分钟没有起飞”
 “连续 Turtle 次数过多”
 “本次飞行稳定性提升”
@@ -298,7 +296,7 @@ WebSocket Subscribers
 
 ## 安装依赖
 
-```bash
+```
 npm install
 ```
 
@@ -306,13 +304,13 @@ npm install
 
 ## 启动前端
 
-```bash
+```
 npm run dev
 ```
 
 默认：
 
-```text
+```
 http://localhost:5173
 ```
 
@@ -320,13 +318,13 @@ http://localhost:5173
 
 ## 启动后端
 
-```bash
+```
 node server.js
 ```
 
 默认：
 
-```text
+```
 http://localhost:3000
 ```
 
@@ -334,13 +332,13 @@ http://localhost:3000
 
 ## 构建生产版本
 
-```bash
+```
 npm run build
 ```
 
 构建输出：
 
-```text
+```
 dist/
 ```
 
@@ -352,7 +350,7 @@ Express 会自动托管 dist。
 
 首次连接需要用户点击授权：
 
-```js
+```
 navigator.serial.requestPort()
 ```
 
@@ -364,7 +362,7 @@ navigator.serial.requestPort()
 
 仅自动连接：
 
-```text
+```
 VID = 0x0483
 PID = 0x5740
 ```
@@ -377,7 +375,7 @@ PID = 0x5740
 
 ## MCU 串口 JSON
 
-```json
+```
 {
   "type": "rx_batch",
   "v": 1,
@@ -398,7 +396,7 @@ PID = 0x5740
 
 ## WebSocket live batch
 
-```json
+```
 {
   "type": "live_batch",
   "room": "default",
@@ -412,7 +410,7 @@ PID = 0x5740
 
 浏览器写串口：
 
-```text
+```
 BIND:1
 ```
 
@@ -420,7 +418,7 @@ BIND:1
 
 # 项目结构
 
-```text
+```
 server.js
 
 src/
@@ -478,9 +476,9 @@ dist/
 
 长期目标是：
 
-```text
-构建一个真正可量化、可分析、可 AI 辅助的 FPV 训练系统
-```
+
+*构建一个真正可量化、可分析、可 AI 辅助的 FPV 训练系统*
+
 
 让 FPV 训练：
 
@@ -494,6 +492,3 @@ dist/
 # License
 
 MIT
-
-```
-```
