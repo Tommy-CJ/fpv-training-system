@@ -7,6 +7,8 @@ function makeParticipant(pilot, index) {
     receiverId: index + 1,
     videoBand: "L",
     videoChannel: "L1",
+    trainingStartAt: null,
+    trainingEndAt: null,
   };
 }
 
@@ -30,6 +32,19 @@ function getVideoNumbers(band) {
   return videoChannels.all
     .filter((channel) => channel[0] === band)
     .map((channel) => channel.slice(1));
+}
+
+function formatDateTimeLocal(ms) {
+  if (!ms) return "";
+  const date = new Date(ms);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function parseDateTimeLocal(value) {
+  if (!value) return null;
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) ? time : null;
 }
 
 function formatSerialTime(ms) {
@@ -368,8 +383,8 @@ export default function EventPage({ pilots, events, live, serialState, serialPow
 
         <div style={{ display: "grid", gap: 10 }}>
           {currentEvent.participants.map((participant, index) => (
-            <div key={`${participant.pilotId}-${index}`} style={{ display: "grid", gridTemplateColumns: "44px minmax(180px,1.5fr) 120px 86px 86px auto", gap: 8, alignItems: "center" }}>
-              <strong style={{ textAlign: "center" }}>{index + 1}</strong>
+            <div key={`${participant.pilotId}-${index}`} style={{ display: "grid", gridTemplateColumns: "44px repeat(auto-fit,minmax(118px,1fr))", gap: 8, alignItems: "end", width: "100%", maxWidth: "100%" }}>
+              <strong style={{ textAlign: "center", alignSelf: "center" }}>{index + 1}</strong>
               <select value={participant.pilotId} onChange={(e) => updateParticipant(index, { pilotId: e.target.value })} style={inputStyle}>
                 <option value="">选择飞手</option>
                 {selectablePilots(index).map((pilot) => <option key={pilot.id} value={pilot.id}>{pilot.name}</option>)}
@@ -384,7 +399,25 @@ export default function EventPage({ pilots, events, live, serialState, serialPow
               <select value={(participant.videoChannel || "L1").slice(1)} onChange={(e) => updateVideoNumber(index, e.target.value)} style={inputStyle}>
                 {getVideoNumbers(participant.videoBand || participant.videoChannel?.[0] || "L").map((number) => <option key={number} value={number}>{number}</option>)}
               </select>
-              <button type="button" style={buttonStyle} onClick={() => removeParticipant(index)}>移除</button>
+              <label style={{ minWidth: 0 }}>
+                <div style={{ color: "#64748b", fontSize: 12, marginBottom: 4 }}>有效开始</div>
+                <input
+                  type="datetime-local"
+                  value={formatDateTimeLocal(participant.trainingStartAt)}
+                  onChange={(e) => updateParticipant(index, { trainingStartAt: parseDateTimeLocal(e.target.value) })}
+                  style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }}
+                />
+              </label>
+              <label style={{ minWidth: 0 }}>
+                <div style={{ color: "#64748b", fontSize: 12, marginBottom: 4 }}>有效结束</div>
+                <input
+                  type="datetime-local"
+                  value={formatDateTimeLocal(participant.trainingEndAt)}
+                  onChange={(e) => updateParticipant(index, { trainingEndAt: parseDateTimeLocal(e.target.value) })}
+                  style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }}
+                />
+              </label>
+              <button type="button" style={{ ...buttonStyle, alignSelf: "center" }} onClick={() => removeParticipant(index)}>移除</button>
             </div>
           ))}
         </div>

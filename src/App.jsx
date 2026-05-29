@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import TrainingPage from "./TrainingPage.jsx";
+import { TrackAudiencePanel } from "./pages/TrackManagementPage.jsx";
 
 const MATCH_W = 270;
 const MATCH_H = 128;
@@ -843,9 +844,25 @@ export default function DoubleEliminationBracket() {
         <div style={{ ...styles.container, minHeight: "calc(100vh - 44px)", justifyContent: "center" }}>
           <section style={{ ...styles.panel, display: "grid", gap: 18 }}>
             <h1 style={styles.title}>FPV 赛事与训练系统</h1>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: 12 }}>
-              <button type="button" style={{ ...styles.button, ...styles.primaryButton, height: 56 }} onClick={() => setPage("publicMonitor")}>训练状态监测</button>
-              <button type="button" style={{ ...styles.button, height: 56 }} onClick={() => setPage("bracket")}>模拟双败淘汰赛</button>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: 14 }}>
+              <button type="button"
+                onClick={() => setPage("trackDisplay")}
+                style={{ height: 72, borderRadius: 16, border: "none", padding: "0 24px", cursor: "pointer", fontWeight: 800, fontSize: 16, background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)", color: "#fff", boxShadow: "0 8px 32px rgba(102,126,234,.35)", transition: "transform .15s, box-shadow .15s" }}
+                onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-2px)"; e.currentTarget.style.boxShadow = "0 14px 40px rgba(102,126,234,.45)"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "0 8px 32px rgba(102,126,234,.35)"; }}
+              >🛤️ 训练赛道</button>
+              <button type="button"
+                onClick={() => setPage("publicMonitor")}
+                style={{ height: 72, borderRadius: 16, border: "none", padding: "0 24px", cursor: "pointer", fontWeight: 800, fontSize: 16, background: "linear-gradient(135deg, #0ea5e9 0%, #06b6d4 50%, #10b981 100%)", color: "#fff", boxShadow: "0 8px 32px rgba(14,165,233,.35)", transition: "transform .15s, box-shadow .15s" }}
+                onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-2px)"; e.currentTarget.style.boxShadow = "0 14px 40px rgba(14,165,233,.45)"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "0 8px 32px rgba(14,165,233,.35)"; }}
+              >📡 训练状态监测</button>
+              <button type="button"
+                onClick={() => setPage("bracket")}
+                style={{ height: 72, borderRadius: 16, border: "none", padding: "0 24px", cursor: "pointer", fontWeight: 800, fontSize: 16, background: "linear-gradient(135deg, #f59e0b 0%, #ef4444 100%)", color: "#fff", boxShadow: "0 8px 32px rgba(245,158,11,.35)", transition: "transform .15s, box-shadow .15s" }}
+                onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-2px)"; e.currentTarget.style.boxShadow = "0 14px 40px rgba(245,158,11,.45)"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "0 8px 32px rgba(245,158,11,.35)"; }}
+              >🏆 模拟双败淘汰赛</button>
             </div>
             <button type="button" style={{ ...styles.button, height: 44, background: "#f8fafc", color: "#64748b" }} onClick={() => { setCoachPassword(""); setCoachError(""); setPage("coachLogin"); }}>
               教练模式
@@ -876,6 +893,23 @@ export default function DoubleEliminationBracket() {
 
   if (page === "publicMonitor") {
     return <TrainingPage audience initialTab="monitor" onBack={() => setPage("portal")} />;
+  }
+
+  if (page === "trackDisplay") {
+    return (
+      <div style={styles.page}>
+        <div style={{ ...styles.container, maxWidth: 1500 }}>
+          <header style={{ ...styles.panel, ...styles.header }}>
+            <div>
+              <h1 style={styles.title}>训练赛道</h1>
+              <div style={styles.subtitle}>展示当前训练赛道、器材统计和当前选中的搬运方案。</div>
+            </div>
+            <button type="button" style={styles.button} onClick={() => setPage("portal")}>返回首页</button>
+          </header>
+          <TrackAudiencePanel showEmpty />
+        </div>
+      </div>
+    );
   }
 
   if (page === "coachTraining") {

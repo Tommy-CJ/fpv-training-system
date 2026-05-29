@@ -172,6 +172,17 @@ function sampleFromBand(band, time, pilotId, receiverId, latestSample) {
   };
 }
 
+function optionalTimestamp(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function getParticipantTrainingWindow(eventStart, participant, now = Date.now()) {
+  const start = Math.max(eventStart, optionalTimestamp(participant?.trainingStartAt) || eventStart);
+  const end = Math.max(start, optionalTimestamp(participant?.trainingEndAt) || now);
+  return { start, end };
+}
+
 function samplesFromLiveState(seed, pilotId, receiverId) {
   const storedSamples = seed?.samplesByPilot?.[pilotId];
   if (storedSamples?.length) {
@@ -212,6 +223,18 @@ function getRecentSamples(samples, since) {
   let index = samples.length - 1;
   while (index >= 0 && samples[index].time >= since) index -= 1;
   return samples.slice(index + 1);
+}
+
+function mergeAuthoritativeBandsWithLiveTail(authoritativeBands = [], liveBands = []) {
+  if (!authoritativeBands.length) return liveBands;
+  if (!liveBands.length) return authoritativeBands;
+  const lastAuthoritativeEnd = Math.max(...authoritativeBands.map((band) => band.end));
+  const merged = authoritativeBands.map((band) => ({ ...band }));
+  for (const band of liveBands) {
+    if (band.end <= lastAuthoritativeEnd) continue;
+    appendBand(merged, band.state, Math.max(band.start, lastAuthoritativeEnd), band.end);
+  }
+  return merged;
 }
 
 const Waveform = memo(function Waveform({ bands, windowStart, windowMs, currentTime }) {
@@ -289,6 +312,7 @@ function makeEmptySummary(pilotId) {
 const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, participant, eventStart, windowStart, windowMs, latestSamplesRef, renderTick, stateSeed }) {
   const samplesRef = useRef([]);
   const bandsRef = useRef([]);
+  const authoritativeBandsRef = useRef([]);
   const summaryRef = useRef({ totalFlightMs: 0, totalTurtleMs: 0, lastFlightEndedAt: null });
   const lastSerialTimeRef = useRef(0);
   const lastSummaryAtRef = useRef(0);
@@ -301,6 +325,8 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
     waveNow: INITIAL_NOW,
     summary: makeEmptySummary(pilot.id),
   }));
+  const trainingWindow = getParticipantTrainingWindow(eventStart, participant, view.now || INITIAL_NOW);
+  const trainingStart = trainingWindow.start;
 
   useEffect(() => {
     let frameId = 0;
@@ -330,16 +356,12 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
     }
 
     if (latestLocalSample && Date.now() - latestLocalSample.time < 2000) {
-      if (!seededBands.length && !nextSummary) return undefined;
+      if (!seededBands.length) return undefined;
       frameId = window.requestAnimationFrame(() => {
-        if (seededBands.length && bandsRef.current.length === 0) {
-          bandsRef.current = [...seededBands];
-        }
-        if (nextSummary) summaryRef.current = nextSummaryRef;
+        authoritativeBandsRef.current = [...seededBands];
         setView((current) => ({
           ...current,
-          bands: seededBands.length && current.bands.length === 0 ? [...seededBands] : current.bands,
-          summary: nextSummary || current.summary,
+          bands: mergeAuthoritativeBandsWithLiveTail(seededBands, bandsRef.current),
         }));
       });
       return () => {
@@ -349,9 +371,9 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
 
     const seedSamples = samplesFromLiveState(stateSeed, pilot.id, participant.receiverId);
     const restored = [];
-    const restoredBands = seededBands.length ? [...seededBands] : [];
+    const restoredBands = seededBands.length ? [...seededBands] : [...authoritativeBandsRef.current];
     for (const rawSeed of seedSamples) {
-      if (rawSeed.time < eventStart) continue;
+      if (rawSeed.time < trainingStart) continue;
       const rawSample = { ...rawSeed, pilotId: pilot.id, receiverId: participant.receiverId };
       const recent = restored.filter((item) => item.time >= rawSample.time - 5000);
       const hasStoredState = typeof rawSample.armed === "boolean" || typeof rawSample.flying === "boolean" || typeof rawSample.turtle === "boolean";
@@ -368,13 +390,16 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
 
     frameId = window.requestAnimationFrame(() => {
       samplesRef.current = restored.length ? getRecentSamples(restored, Date.now() - RECENT_SAMPLE_WINDOW_MS) : [];
+      if (seededBands.length) authoritativeBandsRef.current = seededBands;
       bandsRef.current = restoredBands;
       summaryRef.current = nextSummaryRef;
       lastSerialTimeRef.current = restored[restored.length - 1]?.time || 0;
       const nowTime = Date.now();
       setView((current) => ({
         ...current,
-        bands: [...restoredBands],
+        bands: seededBands.length
+          ? mergeAuthoritativeBandsWithLiveTail(seededBands, restoredBands)
+          : current.bands,
         latest: restored[restored.length - 1] || current.latest,
         recent: getRecentSamples(restored, nowTime - 5000),
         now: nowTime,
@@ -386,12 +411,12 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
     return () => {
       if (frameId) window.cancelAnimationFrame(frameId);
     };
-  }, [eventStart, stateSeed, participant.receiverId, pilot]);
+  }, [eventStart, stateSeed, participant.receiverId, pilot, trainingStart]);
 
   const buildSummary = useCallback((nowTime) => {
     const latestSample = samplesRef.current[samplesRef.current.length - 1] || null;
     const currentState = stateFromSample(latestSample);
-    const liveDuration = latestSample ? Math.max(0, Math.min(nowTime, latestSample.time + MAX_SAMPLE_GAP_MS) - Math.max(eventStart, latestSample.time)) : 0;
+    const liveDuration = latestSample ? Math.max(0, Math.min(nowTime, latestSample.time + MAX_SAMPLE_GAP_MS) - Math.max(trainingStart, latestSample.time)) : 0;
     const totalFlightMs = summaryRef.current.totalFlightMs + (currentState === "flying" ? liveDuration : 0);
     const totalTurtleMs = summaryRef.current.totalTurtleMs + (currentState === "turtle" ? liveDuration : 0);
     const lastFlightEndedAt = currentState === "flying" && latestSample ? Math.min(nowTime, latestSample.time + MAX_SAMPLE_GAP_MS) : summaryRef.current.lastFlightEndedAt;
@@ -402,11 +427,11 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
       pilotId: pilot.id,
       totalFlightMs,
       totalTurtleMs,
-      utilization: totalFlightMs / Math.max(1, nowTime - eventStart),
+      utilization: totalFlightMs / Math.max(1, nowTime - trainingStart),
       idleMs: lastFlightEndedAt === null ? null : Math.max(0, nowTime - lastFlightEndedAt),
       segments,
     };
-  }, [eventStart, pilot.id]);
+  }, [pilot.id, trainingStart]);
 
   const processExternalSample = useCallback((externalSample, nowTime) => {
     if (!externalSample) return { changed: false, stateChanged: false };
@@ -419,8 +444,8 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
     const sample = { ...rawSample, armed: state.armed, flying: state.flying, turtle: state.turtle };
     const previousSample = samplesRef.current[samplesRef.current.length - 1] || null;
     let stateChanged = !previousSample || stateFromSample(previousSample) !== stateFromSample(sample);
-    if (previousSample && previousSample.time >= eventStart) {
-      const intervalStart = Math.max(eventStart, previousSample.time);
+    if (previousSample && previousSample.time >= trainingStart) {
+      const intervalStart = Math.max(trainingStart, previousSample.time);
       const sampleGap = sampleTime - previousSample.time;
       if (sampleGap <= MAX_SAMPLE_GAP_MS) {
         const intervalEnd = Math.min(sampleTime, previousSample.time + MAX_SAMPLE_GAP_MS);
@@ -436,7 +461,7 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
     }
     samplesRef.current = [...samplesRef.current, sample].filter((item) => item.time >= sampleTime - RECENT_SAMPLE_WINDOW_MS);
     return { changed: true, stateChanged };
-  }, [eventStart, participant.receiverId, pilot]);
+  }, [participant.receiverId, pilot, trainingStart]);
 
   useEffect(() => {
     const frameId = window.requestAnimationFrame(() => {
@@ -449,7 +474,7 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
       if (shouldRefreshSummary) lastSummaryAtRef.current = nowTime;
       if (shouldRefreshBands) lastBandRenderAtRef.current = nowTime;
       setView((current) => ({
-        bands: shouldRefreshBands ? [...bandsRef.current] : current.bands,
+        bands: shouldRefreshBands ? mergeAuthoritativeBandsWithLiveTail(authoritativeBandsRef.current, bandsRef.current) : current.bands,
         latest: samplesRef.current[samplesRef.current.length - 1] || current.latest,
         recent: getRecentSamples(samplesRef.current, nowTime - 5000),
         now: changed ? Number(externalSample?.time) || nowTime : nowTime,
@@ -465,7 +490,19 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
   const state = getPilotState(pilot, latest, recent);
   const receiverOnline = Boolean(latest.time && view.now - latest.time < 1500);
   const paired = Boolean(receiverOnline && (latest.lq > 0 || latest.rssi > -127));
-  const summary = view.summary || makeEmptySummary(pilot.id);
+  const authoritativeSummary = stateSeed?.summaries?.[pilot.id] || null;
+  const summaryNow = view.now || INITIAL_NOW;
+  const authoritativeUpdatedAt = Number(authoritativeSummary?.updatedAt || summaryNow);
+  const authoritativeIdleMs = authoritativeSummary?.idleMs === null || authoritativeSummary?.idleMs === undefined
+    ? null
+    : Math.max(0, Number(authoritativeSummary.idleMs || 0) + Math.max(0, summaryNow - authoritativeUpdatedAt));
+  const summary = authoritativeSummary ? {
+    pilotId: pilot.id,
+    totalFlightMs: authoritativeSummary.totalFlightMs || 0,
+    utilization: (authoritativeSummary.totalFlightMs || 0) / Math.max(1, summaryNow - trainingStart),
+    idleMs: authoritativeIdleMs,
+    totalTurtleMs: authoritativeSummary.totalTurtleMs || 0,
+  } : view.summary || makeEmptySummary(pilot.id);
   const channels = latest.channels || {};
   const modeName = getModeName(pilot, latest);
   const roll = normalizeStick(channels.ch1 ?? CHANNEL_MID);
@@ -581,10 +618,10 @@ export default function MonitorPage({ pilots, events, latestSamplesRef, renderTi
   }, []);
 
   useEffect(() => {
-    if (!activeEvent) return;
+    if (!activeEventId) return;
     let stopped = false;
     async function loadStoredOverview() {
-      const overview = await apiGet(`/api/training-events/${activeEvent.id}/stats?cached=1`, { stats: [], segments: [] });
+      const overview = await apiGet(`/api/training-events/${activeEventId}/stats?cached=1`, { stats: [], segments: [] });
       if (stopped) return;
       const summaries = {};
       const segmentsByPilot = {};
@@ -607,13 +644,18 @@ export default function MonitorPage({ pilots, events, latestSamplesRef, renderTi
       for (const [pilotId, segments] of Object.entries(segmentsByPilot)) {
         bandsByPilot[pilotId] = bandsFromSegments(segments);
       }
-      setStoredStateSeed({ eventId: activeEvent.id, version: Date.now(), summaries, bandsByPilot });
+      setStoredStateSeed({ eventId: activeEventId, version: Date.now(), summaries, bandsByPilot });
     }
     loadStoredOverview();
+    function handleVisible() {
+      if (document.visibilityState === "visible") loadStoredOverview();
+    }
+    document.addEventListener("visibilitychange", handleVisible);
     return () => {
       stopped = true;
+      document.removeEventListener("visibilitychange", handleVisible);
     };
-  }, [activeEvent, eventStart]);
+  }, [activeEventId]);
 
   if (!activeEvent) {
     return (

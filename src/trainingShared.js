@@ -72,6 +72,16 @@ export async function apiGet(path, fallback) {
   }
 }
 
+function errorMessageFromResponseText(text, status) {
+  if (!text) return `HTTP ${status}`;
+  try {
+    const payload = JSON.parse(text);
+    return payload.error || payload.message || text;
+  } catch {
+    return text;
+  }
+}
+
 export async function apiPost(path, data) {
   const response = await fetch(path, {
     method: "POST",
@@ -80,7 +90,20 @@ export async function apiPost(path, data) {
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `HTTP ${response.status}`);
+    throw new Error(errorMessageFromResponseText(text, response.status));
+  }
+  return response.json();
+}
+
+export async function apiPut(path, data) {
+  const response = await fetch(path, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(errorMessageFromResponseText(text, response.status));
   }
   return response.json();
 }
@@ -89,7 +112,7 @@ export async function apiDelete(path) {
   const response = await fetch(path, { method: "DELETE" });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `HTTP ${response.status}`);
+    throw new Error(errorMessageFromResponseText(text, response.status));
   }
   return response.json();
 }
