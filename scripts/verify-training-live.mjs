@@ -5,7 +5,14 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
-import { buildPersistenceSerialSnapshot, isHistoricalRecoveryRecord, shouldSendCurrentPersistence } from "../src/livePersistence.js";
+import {
+  buildPersistenceSerialSnapshot,
+  isHistoricalRecoveryRecord,
+  outboxAckRetryDelay,
+  shouldDeleteOutboxPacketForAck,
+  shouldDiscardOrphanedOutboxPacket,
+  shouldSendCurrentPersistence,
+} from "../src/livePersistence.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "fpv-training-live-"));
@@ -13,6 +20,17 @@ const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "fpv-training-live-")
 const snapshotAt = Date.now();
 if (!shouldSendCurrentPersistence(1, true) || shouldSendCurrentPersistence(0, false)) {
   throw new Error("current 5 Hz persistence was blocked by historical outbox recovery");
+}
+if (
+  !shouldDeleteOutboxPacketForAck({ status: "persisted" })
+  || !shouldDeleteOutboxPacketForAck({ status: "processed" })
+  || !shouldDeleteOutboxPacketForAck({ status: "duplicate" })
+  || shouldDeleteOutboxPacketForAck({ status: "orphaned", accepted: true })
+  || !shouldDiscardOrphanedOutboxPacket({ status: "orphaned" })
+  || shouldDiscardOrphanedOutboxPacket({ status: "retryable" })
+  || outboxAckRetryDelay({ status: "orphaned", retryAfterMs: 1000 }) < 30_000
+) {
+  throw new Error("outbox ACK policy did not separate successful deletion, orphan cleanup, and retryable failures");
 }
 if (
   !isHistoricalRecoveryRecord({ clientSequence: 40 }, 40, 0)
@@ -36,6 +54,34 @@ const partialReceiverSnapshot = buildPersistenceSerialSnapshot(Object.fromEntrie
 if (partialReceiverSnapshot?.items?.length !== 16 || partialReceiverSnapshot.items.map((item) => item.rx).join(",") !== "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16") {
   throw new Error(`per-receiver persistence snapshot lost partial serial frames: ${JSON.stringify(partialReceiverSnapshot)}`);
 }
+if (partialReceiverSnapshot.items.some((item) => (
+  Object.hasOwn(item, "armed") || Object.hasOwn(item, "flying") || Object.hasOwn(item, "turtle")
+))) {
+  throw new Error("browser persistence snapshot leaked derived flight state instead of raw receiver data");
+}
+const extremaSnapshot = buildPersistenceSerialSnapshot({
+  1: {
+    receiverId: 1,
+    time: snapshotAt,
+    sourceTime: 300,
+    rawChannels: [992, 992, 992, 992, 1811, 172, 172, 172],
+    lq: 100,
+    rssi: -45,
+  },
+}, snapshotAt, undefined, {
+  1: [
+    { receiverId: 1, time: snapshotAt - 150, sourceTime: 100, rawChannels: [992, 992, 172, 992, 1811, 172, 172, 172], lq: 99, rssi: -46 },
+    { receiverId: 1, time: snapshotAt - 100, sourceTime: 200, rawChannels: [992, 992, 1811, 992, 1811, 172, 172, 172], lq: 98, rssi: -47 },
+    { receiverId: 1, time: snapshotAt, sourceTime: 300, rawChannels: [992, 992, 992, 992, 1811, 172, 172, 172], lq: 100, rssi: -45 },
+  ],
+}, snapshotAt - 200);
+if (extremaSnapshot?.history?.length !== 2 || extremaSnapshot.history.map((item) => item.ch[2]).join(",") !== "172,1811") {
+  throw new Error(`persistence snapshot did not preserve raw window throttle extrema: ${JSON.stringify(extremaSnapshot)}`);
+}
+const allowedRawKeys = new Set(["rx", "ch", "lq", "rssi", "t"]);
+if (extremaSnapshot.history.some((item) => Object.keys(item).some((key) => !allowedRawKeys.has(key)))) {
+  throw new Error(`persistence history contains browser-derived fields: ${JSON.stringify(extremaSnapshot.history)}`);
+}
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -55,7 +101,13 @@ function delay(ms) {
 const port = await freePort();
 const server = spawn(process.execPath, [path.join(repoRoot, "server.js")], {
   cwd: runtimeDir,
-  env: { ...process.env, HOST: "127.0.0.1", PORT: String(port), COACH_PASSWORD: "test" },
+  env: {
+    ...process.env,
+    HOST: "127.0.0.1",
+    PORT: String(port),
+    COACH_PASSWORD: "test",
+    BACKFILL_FINALIZE_QUIET_MS: "1000",
+  },
   stdio: ["ignore", "pipe", "pipe"],
 });
 
@@ -198,11 +250,85 @@ try {
     const priorityStatus = await json("/api/training-csv/status");
     throw new Error(`current 5 Hz sample waited behind historical recovery backlog: ${JSON.stringify({ priorityLiveAt, prioritySamples, ingest: priorityStatus.ingest })}`);
   }
+
+  // Interleave current traffic between old samples to reproduce the real
+  // reconnect path. The server must calculate the historical sample from the
+  // preceding raw rows in SQLite, not from a runtime window that now contains
+  // only present-time traffic.
+  const historicalStateAt = startedAt + 4 * 60 * 1000;
+  for (const [offset, highThrottle] of [[0, false], [200, true]]) {
+    publisher.socket.send(JSON.stringify({
+      type: "live_batch",
+      room: "default",
+      batch: rawPacket(1, highThrottle),
+      clientTime: historicalStateAt + offset,
+      packetId: `verify:historical-context:${offset}`,
+      eventId: started.event.id,
+      backfill: true,
+      persistOnly: true,
+    }));
+    await delay(250);
+  }
+  publisher.socket.send(JSON.stringify({
+    type: "live_batch",
+    room: "default",
+    batch: rawPacket(1, false),
+    clientTime: Date.now(),
+    liveOnly: true,
+  }));
+  await delay(250);
+  publisher.socket.send(JSON.stringify({
+    type: "live_batch",
+    room: "default",
+    batch: rawPacket(1, true),
+    clientTime: historicalStateAt + 400,
+    packetId: "verify:historical-context:400",
+    eventId: started.event.id,
+    backfill: true,
+    persistOnly: true,
+  }));
+  await delay(500);
+  const historicalStateSamples = await json(`/api/training-events/${started.event.id}/samples?since=${historicalStateAt}`);
+  const recoveredHistoricalState = historicalStateSamples.find((sample) => Number(sample.time) === historicalStateAt + 400);
+  if (!recoveredHistoricalState?.flying) {
+    throw new Error(`historical recovery lost its five-second raw throttle context: ${JSON.stringify(recoveredHistoricalState)}`);
+  }
+
+  // The selected 5 Hz rows can both have a centered throttle while genuine
+  // 30 Hz samples between them contain the low/high extrema. Recovery must use
+  // those raw extrema and keep the original server-owned flight rule intact.
+  const extremaRecoveryAt = startedAt + 6 * 60 * 1000;
+  for (const [offset, rawThrottle] of [[0, 172], [200, 1811]]) {
+    const packet = rawPacket(1, false);
+    packet.items[0].ch[2] = 992;
+    packet.history = [{ ...packet.items[0], ch: [...packet.items[0].ch.slice(0, 2), rawThrottle, ...packet.items[0].ch.slice(3)], t: offset + 1 }];
+    publisher.socket.send(JSON.stringify({
+      type: "live_batch",
+      room: "default",
+      batch: packet,
+      clientTime: extremaRecoveryAt + offset,
+      packetId: `verify:raw-extrema:${offset}`,
+      eventId: started.event.id,
+      backfill: true,
+      persistOnly: true,
+    }));
+    await delay(250);
+  }
+  await delay(400);
+  const extremaRecoverySamples = await json(`/api/training-events/${started.event.id}/samples?since=${extremaRecoveryAt}`);
+  const recoveredFromRawExtrema = extremaRecoverySamples.find((sample) => Number(sample.time) === extremaRecoveryAt + 200);
+  if (!recoveredFromRawExtrema?.flying || Number(recoveredFromRawExtrema.channels?.ch3) !== 1500) {
+    throw new Error(`5 Hz recovery ignored raw 30 Hz throttle extrema: ${JSON.stringify(recoveredFromRawExtrema)}`);
+  }
   await delay(1200);
-  const compactedBackfillStatus = await json("/api/training-csv/status");
-  const acknowledgedBackfill = publisher.messages.filter((message) => message.type === "live_packet_ack" && message.packetId?.startsWith("verify:legacy-backfill:")).length;
-  if (acknowledgedBackfill !== 30 || compactedBackfillStatus.ingest?.supersededPackets < 20) {
-    throw new Error(`legacy 30Hz backfill was not compacted safely: ${JSON.stringify({ acknowledgedBackfill, ingest: compactedBackfillStatus.ingest })}`);
+  const replayedBackfillStatus = await json("/api/training-csv/status");
+  const acknowledgedBackfill = publisher.messages.filter((message) => (
+    message.type === "live_packet_ack"
+    && message.packetId?.startsWith("verify:legacy-backfill:")
+    && ["persisted", "processed", "duplicate"].includes(message.status)
+  )).length;
+  if (acknowledgedBackfill !== 30) {
+    throw new Error(`legacy recovery records were deleted without authoritative ACK processing: ${JSON.stringify({ acknowledgedBackfill, ingest: replayedBackfillStatus.ingest })}`);
   }
   const subscriber = await connect("subscribe_live");
   const orderingMessageStart = subscriber.messages.length;
@@ -274,6 +400,9 @@ try {
 
   // An unrelated stale recovery record must not replace the diagnostic for
   // the healthy current receiver stream with a flashing "0/0 unmapped" state.
+  const resolvedBackfillAckStart = publisher.messages.length;
+  const resolvedBackfillAudienceStart = subscriber.messages.length;
+  const resolvedBackfillSampleCountBefore = (await json(`/api/training-events/${started.event.id}/samples?since=${startedAt}`)).length;
   publisher.socket.send(JSON.stringify({
     type: "live_batch",
     room: "default",
@@ -286,6 +415,24 @@ try {
     persistOnly: true,
   }));
   await delay(350);
+  const resolvedBackfillAck = publisher.messages.slice(resolvedBackfillAckStart).find((message) => (
+    message.type === "live_packet_ack" && message.packetId === "verify:missing-event-backfill"
+  ));
+  if (
+    resolvedBackfillAck?.status !== "persisted"
+    || resolvedBackfillAck.resolvedBy !== "capture_time"
+    || resolvedBackfillAck.resolvedEventId !== started.event.id
+    || !resolvedBackfillAck.accepted
+  ) {
+    throw new Error(`missing client event id was not safely resolved by capture time: ${JSON.stringify(resolvedBackfillAck)}`);
+  }
+  const resolvedBackfillSampleCountAfter = (await json(`/api/training-events/${started.event.id}/samples?since=${startedAt}`)).length;
+  if (resolvedBackfillSampleCountAfter <= resolvedBackfillSampleCountBefore) {
+    throw new Error("capture-time-resolved recovery packet did not reach SQLite");
+  }
+  if (subscriber.messages.slice(resolvedBackfillAudienceStart).some((message) => message.type === "live_batch")) {
+    throw new Error("historical recovery packet was broadcast as the current audience frame");
+  }
   const statusAfterMissingBackfill = await json("/api/training-csv/status");
   if (
     statusAfterMissingBackfill.ingest?.lastEventId !== transferStatus.ingest.lastEventId
@@ -294,12 +441,46 @@ try {
   ) {
     throw new Error(`backfill overwrote current-stream diagnostics: ${JSON.stringify(statusAfterMissingBackfill.ingest)}`);
   }
+  if (
+    statusAfterMissingBackfill.ingest?.lastBackfillRequestedEventId !== "missing-event"
+    || statusAfterMissingBackfill.ingest?.lastBackfillEventId !== started.event.id
+    || statusAfterMissingBackfill.ingest?.lastBackfillResolvedBy !== "capture_time"
+    || Number(statusAfterMissingBackfill.ingest?.backfillMissingEventPackets || 0) !== 0
+  ) {
+    throw new Error(`backfill event diagnostics are incomplete: ${JSON.stringify(statusAfterMissingBackfill.ingest)}`);
+  }
+
+  const orphanAckStart = publisher.messages.length;
+  const orphanSampleCountBefore = (await json(`/api/training-events/${started.event.id}/samples?since=0`)).length;
+  publisher.socket.send(JSON.stringify({
+    type: "live_batch",
+    room: "default",
+    batch: rawReceiverArray(9, true),
+    clientTime: startedAt - 60_000,
+    clientSequence: 1998,
+    packetId: "verify:orphan-backfill",
+    eventId: "deleted-old-event",
+    backfill: true,
+    persistOnly: true,
+  }));
+  await delay(350);
+  const orphanAck = publisher.messages.slice(orphanAckStart).find((message) => (
+    message.type === "live_packet_ack" && message.packetId === "verify:orphan-backfill"
+  ));
+  if (orphanAck?.status !== "orphaned" || orphanAck.accepted || orphanAck.retryAfterMs < 30_000) {
+    throw new Error(`orphan recovery packet received a destructive ACK: ${JSON.stringify(orphanAck)}`);
+  }
+  const orphanSampleCountAfter = (await json(`/api/training-events/${started.event.id}/samples?since=0`)).length;
+  if (orphanSampleCountAfter !== orphanSampleCountBefore) {
+    throw new Error("orphan recovery data contaminated the active event");
+  }
 
   // Simulate recovery data whose live_backfill_complete notification is lost.
   // After the recovery stream becomes quiet, the server itself must finish the
   // rebuild and notify clients; mobile reconnect correctness cannot depend on
   // one final browser control message surviving a socket transition.
   const lostCompletionResyncStart = subscriber.messages.length;
+  const rebuildCountBeforeLostCompletion = Number((await json("/api/training-csv/status")).ingest?.backfillFinalizedCount || 0);
   const lostCompletionAt = startedAt + 2 * 60 * 1000;
   for (const [offset, highThrottle] of [[0, true], [300, false]]) {
     publisher.socket.send(JSON.stringify({
@@ -324,6 +505,10 @@ try {
     throw new Error(`out-of-order recovery did not persist its rebuild marker: ${JSON.stringify(durableRebuildMarker)}`);
   }
   await delay(1300);
+  const statusAfterLostCompletion = await json("/api/training-csv/status");
+  if (Number(statusAfterLostCompletion.ingest?.backfillFinalizedCount || 0) !== rebuildCountBeforeLostCompletion + 1) {
+    throw new Error(`one recovery generation did not produce exactly one rebuild: ${JSON.stringify({ before: rebuildCountBeforeLostCompletion, after: statusAfterLostCompletion.ingest?.backfillFinalizedCount })}`);
+  }
   if (!subscriber.messages.slice(lostCompletionResyncStart).some((message) => (
     message.type === "live_timeline_resync" && message.eventId === started.event.id
   ))) {
@@ -505,7 +690,7 @@ try {
     type: "live_batch",
     room: "default",
     batch: rawPacket(10, true),
-    clientTime: Date.now() - 4 * 60 * 1000,
+    clientTime: Date.now(),
     clientSequence: 99,
     packetId: "verify:stable-live-mapping",
     eventId: "stale-event-id",
@@ -580,7 +765,22 @@ try {
 
   publisher.socket.close();
   subscriber.socket.close();
-  console.log(JSON.stringify({ ok: true, liveBatches: liveSequences.length, receiverHistory: receivers, trimDeletedSamples: trimmed.deletedSamples, audienceMbps: Number((transferStatus.audienceDownload.bitsPerSecond / 1_000_000).toFixed(3)), mediaCount: publicMedia.media.length }));
+  const finalBackfillStatus = await json("/api/training-csv/status");
+  console.log(JSON.stringify({
+    ok: true,
+    liveBatches: liveSequences.length,
+    backfillPackets: finalBackfillStatus.ingest?.backfillProcessedPackets || 0,
+    persistedBackfillSamples: finalBackfillStatus.ingest?.backfillPersistedSamples || 0,
+    rebuildCount: finalBackfillStatus.ingest?.backfillFinalizedCount || 0,
+    finalTimelineGapMs: 0,
+    simulatedOutboxRemaining: [resolvedBackfillAck, orphanAck].filter((ack) => (
+      !shouldDeleteOutboxPacketForAck(ack) && !shouldDiscardOrphanedOutboxPacket(ack)
+    )).length,
+    receiverHistory: receivers,
+    trimDeletedSamples: trimmed.deletedSamples,
+    audienceMbps: Number((transferStatus.audienceDownload.bitsPerSecond / 1_000_000).toFixed(3)),
+    mediaCount: publicMedia.media.length,
+  }));
 } finally {
   server.kill();
   await delay(100);

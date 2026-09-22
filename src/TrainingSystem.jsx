@@ -7,8 +7,20 @@ import CoachPage from "./pages/CoachPage.jsx";
 import HistoryPage from "./pages/HistoryPage.jsx";
 import TrackManagementPage from "./pages/TrackManagementPage.jsx";
 import { apiGet, apiPost, buttonStyle, defaultChannelConfig, isValueInRanges, panelStyle, primaryButtonStyle } from "./trainingShared.js";
-import { cacheLivePacket, deleteCachedLivePacket, listCachedLivePackets } from "./liveOutbox.js";
-import { buildPersistenceSerialSnapshot, isHistoricalRecoveryRecord, shouldSendCurrentPersistence } from "./livePersistence.js";
+import {
+  cacheLivePacket,
+  deleteCachedLivePacket,
+  deleteCachedLivePacketsByEventId,
+  listCachedLivePackets,
+} from "./liveOutbox.js";
+import {
+  buildPersistenceSerialSnapshot,
+  isHistoricalRecoveryRecord,
+  outboxAckRetryDelay,
+  shouldDeleteOutboxPacketForAck,
+  shouldDiscardOrphanedOutboxPacket,
+  shouldSendCurrentPersistence,
+} from "./livePersistence.js";
 import { consumeSerialJsonStream } from "./serialJsonStream.js";
 import {
   claimTrainingSerialPort,
@@ -163,6 +175,46 @@ function mergeLiveBandMaps(existingByPilot = {}, updatesByPilot = {}) {
   return merged;
 }
 
+function replaceLiveBandRange(existingBands = [], updates = [], replaceFrom, replaceTo) {
+  const from = Number(replaceFrom);
+  const to = Number(replaceTo);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return existingBands;
+  const pieces = [];
+  for (const band of existingBands || []) {
+    const start = Number(band?.start);
+    const end = Number(band?.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+    if (end <= from || start >= to) {
+      pieces.push({ ...band, start, end });
+      continue;
+    }
+    if (start < from) pieces.push({ ...band, start, end: from });
+    if (end > to) pieces.push({ ...band, start: to, end });
+  }
+  for (const band of updates || []) {
+    const start = Math.max(from, Number(band?.start));
+    const end = Math.min(to, Number(band?.end));
+    if (Number.isFinite(start) && Number.isFinite(end) && end > start) pieces.push({ ...band, start, end });
+  }
+  const merged = [];
+  for (const band of pieces.sort((left, right) => left.start - right.start)) appendLiveBand(merged, band);
+  return merged;
+}
+
+function replaceLiveBandMapRange(existingByPilot = {}, updatesByPilot = {}, replaceFrom, replaceTo) {
+  const merged = { ...existingByPilot };
+  const pilotIds = new Set([...Object.keys(existingByPilot || {}), ...Object.keys(updatesByPilot || {})]);
+  for (const pilotId of pilotIds) {
+    merged[pilotId] = replaceLiveBandRange(
+      existingByPilot?.[pilotId] || [],
+      updatesByPilot?.[pilotId] || [],
+      replaceFrom,
+      replaceTo,
+    );
+  }
+  return merged;
+}
+
 const LIVE_ROOM_ID = "default";
 // CORE DATA-PLANE INVARIANTS (see docs/LIVE_DATA_PIPELINE.md):
 // - Online transport is one 30 Hz stream; selected ~5 Hz frames are upgraded
@@ -177,12 +229,17 @@ const TRAINING_HUB_VENDOR_ID = 0x0483;
 const TRAINING_HUB_PRODUCT_ID = 0x5740;
 const LIVE_SESSION_STORAGE_KEY = "fpv-training-live-session";
 const LIVE_SEQUENCE_STORAGE_KEY = "fpv-training-live-sequence";
+// PROTECTED LIVE-PIPELINE CONTRACT: this ~5 Hz durable cadence is embedded in
+// the single 30 Hz live stream. It must remain IndexedDB-first and ACK-deleted;
+// do not replace it with a second online persistOnly stream or client-derived
+// flight state. See docs/LIVE_DATA_PIPELINE.md before changing this section.
 const PERSISTENCE_SAMPLE_INTERVAL_MS = 200;
-const OUTBOX_MAX_IN_FLIGHT = 16;
-const OUTBOX_REPLAY_BATCH_SIZE = 3;
-const OUTBOX_REPLAY_INTERVAL_MS = 200;
-const OUTBOX_REPLAY_MIN_INTERVAL_MS = 180;
+const SERIAL_PORT_BUFFER_SIZE = 8 * 1024 * 1024;
+const OUTBOX_MAX_IN_FLIGHT = 64;
+const OUTBOX_REPLAY_BATCH_SIZE = 16;
+const OUTBOX_REPLAY_INTERVAL_MS = 25;
 const OUTBOX_ACK_TIMEOUT_MS = 3000;
+const AUDIENCE_LIVE_STALE_MS = 1000;
 
 function loadLiveSessionId() {
   try {
@@ -434,8 +491,11 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
   const liveClientSequenceRef = useRef(loadLiveSequence());
   const audienceSequenceRef = useRef(0);
   const audienceStreamIdRef = useRef("");
+  const audiencePendingBatchRef = useRef(null);
+  const audienceBatchFrameRef = useRef(0);
   const outboxInFlightRef = useRef(new Map());
   const outboxFlushTimerRef = useRef(0);
+  const outboxFlushDueAtRef = useRef(0);
   const outboxWriteChainRef = useRef(Promise.resolve());
   const outboxRecoveryWriteFenceRef = useRef(Promise.resolve());
   const outboxRecoveringRef = useRef(false);
@@ -444,6 +504,15 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
   const outboxRecoveryHadRecordsRef = useRef(false);
   const outboxEmptyPassesRef = useRef(0);
   const outboxBackfillAtByEventRef = useRef(new Map());
+  const outboxRetryAfterRef = useRef(new Map());
+  const outboxOrphanedRef = useRef(new Map());
+  // Event ids confirmed missing on the server. Keep this knowledge for the
+  // lifetime of the page so a late IndexedDB write cannot resurrect a deleted
+  // event's cache after the first bulk cleanup has completed.
+  const outboxDiscardedEventIdsRef = useRef(new Set());
+  const outboxDiscardCleanupInFlightRef = useRef(new Set());
+  const outboxAcknowledgedDeleteRef = useRef(new Set());
+  const outboxAcknowledgedDeleteTimerRef = useRef(0);
   const persistenceSampleRef = useRef({ eventId: "", capturedAt: 0 });
   const serialStateRef = useRef(null);
   const serialStateUiRef = useRef({ lastAt: 0, receiverCount: 0, maxReceiverId: 0, connected: false });
@@ -462,6 +531,12 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
     outboxPending: 0,
     outboxPendingMore: false,
     outboxError: "",
+    outboxOrphaned: 0,
+    outboxOrphanReason: "",
+    outboxActiveEventId: "",
+    outboxOldestEventId: "",
+    outboxNewestEventId: "",
+    outboxEventGroups: "",
   });
   const [serialState, setSerialState] = useState({
     supported: typeof navigator !== "undefined" && Boolean(navigator.serial),
@@ -969,6 +1044,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
         ]);
         if (stopped) return;
         setPilots(nextPilots.length ? nextPilots : [makePilot(1), makePilot(2)]);
+        eventsRef.current = nextEvents;
         setEvents(nextEvents);
         setLive(nextLive);
         setServerConnected(true);
@@ -1055,7 +1131,11 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       if (portRef.current && portRef.current !== port) {
         await releaseSerialResources({ clear: false });
       }
-      await port.open({ baudRate: 115200 });
+      // Web Serial defaults to only 255 bytes. A hidden tab can be scheduled
+      // late even when its reader remains active, so leave enough native
+      // headroom to absorb a long scheduling stall without cutting a JSON
+      // object in half. The API requires this value to remain below 16 MiB.
+      await port.open({ baudRate: 115200, bufferSize: SERIAL_PORT_BUFFER_SIZE });
       manualSerialDisconnectRef.current = false;
       portRef.current = port;
       startTrainingSerialClaim(port);
@@ -1132,11 +1212,16 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
   }
 
   async function saveEvents(nextEvents) {
+    // Serial sampling reads this ref outside React's render cycle. Update it at
+    // the same instant as the state transition so an event switch cannot emit
+    // even one durable frame under the previous event id.
+    eventsRef.current = nextEvents;
     setEvents(nextEvents);
     try {
       await apiPost("/api/events", nextEvents);
       const refreshedEvents = await apiGet("/api/events", nextEvents);
       const resolvedEvents = Array.isArray(refreshedEvents) ? refreshedEvents : nextEvents;
+      eventsRef.current = resolvedEvents;
       setEvents(resolvedEvents);
       publishTrainingState(resolvedEvents);
       pushStatus("训练事件已保存");
@@ -1215,9 +1300,16 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
 
   const scheduleOutboxFlush = useCallback((delayMs = 0) => {
     if (audience) return;
+    const dueAt = Date.now() + Math.max(0, delayMs);
+    // A new online packet schedules a 3 s ACK watchdog every 200 ms. It must
+    // never postpone an already scheduled 25 ms recovery pump; doing so was the
+    // main reason a four-minute cache drained at only about 8-11 packets/s.
+    if (outboxFlushTimerRef.current && outboxFlushDueAtRef.current <= dueAt) return;
     if (outboxFlushTimerRef.current) window.clearTimeout(outboxFlushTimerRef.current);
+    outboxFlushDueAtRef.current = dueAt;
     outboxFlushTimerRef.current = window.setTimeout(async () => {
       outboxFlushTimerRef.current = 0;
+      outboxFlushDueAtRef.current = 0;
       const socket = liveSocketRef.current;
       const socketReady = Boolean(socket && socket.readyState === 1);
       try {
@@ -1226,7 +1318,45 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
         // can declare the outbox empty just before its final offline records
         // appear in IndexedDB.
         await outboxRecoveryWriteFenceRef.current.catch(() => undefined);
-        const records = await listCachedLivePackets(120);
+        const activeEventId = eventsRef.current.find((event) => event.active)?.id || "";
+        const recoveryCapturedAtCutoff = Number(outboxRecoveryCutoffCapturedAtRef.current) || 0;
+        const records = await listCachedLivePackets(240, [...outboxOrphanedRef.current.keys()], {
+          priorityEventId: activeEventId,
+          capturedAtCutoff: recoveryCapturedAtCutoff || Number.MAX_SAFE_INTEGER,
+        });
+        const discardedEventIds = [...new Set(records
+          .map((record) => String(record?.eventId || ""))
+          .filter((eventId) => eventId && outboxDiscardedEventIdsRef.current.has(eventId)))];
+        if (discardedEventIds.length) {
+          let startedCleanup = false;
+          for (const discardedEventId of discardedEventIds) {
+            if (outboxDiscardCleanupInFlightRef.current.has(discardedEventId)) continue;
+            startedCleanup = true;
+            outboxDiscardCleanupInFlightRef.current.add(discardedEventId);
+            const writeFence = outboxWriteChainRef.current;
+            void writeFence.catch(() => undefined)
+              .then(() => deleteCachedLivePacketsByEventId(discardedEventId))
+              .then((deleted) => {
+                for (const record of records) {
+                  if (String(record?.eventId || "") !== discardedEventId) continue;
+                  outboxInFlightRef.current.delete(record.packetId);
+                  outboxRetryAfterRef.current.delete(record.packetId);
+                  outboxOrphanedRef.current.delete(record.packetId);
+                }
+                if (deleted > 0) pushStatus(`已清理已删除事件 ${discardedEventId} 的 ${deleted} 个残留缓存包`);
+              })
+              .catch((error) => {
+                const outboxError = `已删除事件残留缓存清理失败：${error.message || "IndexedDB 删除失败"}`;
+                setLiveRelayState((current) => ({ ...current, outboxError }));
+              })
+              .finally(() => {
+                outboxDiscardCleanupInFlightRef.current.delete(discardedEventId);
+                scheduleOutboxFlush(0);
+              });
+          }
+          scheduleOutboxFlush(startedCleanup ? 50 : 100);
+          return;
+        }
         const now = Date.now();
         let expiredAcknowledgement = false;
         for (const [packetId, sentAt] of outboxInFlightRef.current) {
@@ -1247,23 +1377,50 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
           outboxEmptyPassesRef.current = 0;
         }
         const recoveryCutoff = Number(outboxRecoveryCutoffSequenceRef.current) || 0;
-        const recoveryCapturedAtCutoff = Number(outboxRecoveryCutoffCapturedAtRef.current) || 0;
         const recoveryRecords = outboxRecoveringRef.current
           ? records.filter((record) => isHistoricalRecoveryRecord(record, recoveryCutoff, recoveryCapturedAtCutoff))
           : [];
+        const eventCounts = new Map();
+        for (const record of recoveryRecords) {
+          const eventId = String(record.eventId || "(无事件ID)");
+          eventCounts.set(eventId, (eventCounts.get(eventId) || 0) + 1);
+        }
+        const outboxEventGroups = [...eventCounts.entries()]
+          .map(([eventId, count]) => `${eventId}: ${count}`)
+          .join("；");
+        const oldestRecoveryRecord = recoveryRecords.reduce((oldest, record) => (
+          !oldest || Number(record.capturedAt || 0) < Number(oldest.capturedAt || 0) ? record : oldest
+        ), null);
+        const newestRecoveryRecord = recoveryRecords.reduce((newest, record) => (
+          !newest || Number(record.capturedAt || 0) > Number(newest.capturedAt || 0) ? record : newest
+        ), null);
+        const outboxOrphaned = outboxOrphanedRef.current.size;
+        const latestOrphan = [...outboxOrphanedRef.current.values()].at(-1);
         setLiveRelayState((current) => {
-          const outboxPending = recoveryRecords.length;
-          const outboxPendingMore = records.length >= 120 && recoveryRecords.length >= 120;
+          const outboxPending = Math.max(recoveryRecords.length, outboxOrphaned);
+          const outboxPendingMore = outboxOrphaned > recoveryRecords.length
+            || (records.length >= 240 && recoveryRecords.length >= 240);
           if (
             current.outboxRecovering === outboxRecoveringRef.current
             && current.outboxPending === outboxPending
             && current.outboxPendingMore === outboxPendingMore
+            && current.outboxOrphaned === outboxOrphaned
+            && current.outboxActiveEventId === activeEventId
+            && current.outboxOldestEventId === String(oldestRecoveryRecord?.eventId || "")
+            && current.outboxNewestEventId === String(newestRecoveryRecord?.eventId || "")
+            && current.outboxEventGroups === outboxEventGroups
           ) return current;
           return {
             ...current,
             outboxRecovering: outboxRecoveringRef.current,
             outboxPending,
             outboxPendingMore,
+            outboxOrphaned,
+            outboxOrphanReason: latestOrphan?.reason || "",
+            outboxActiveEventId: activeEventId,
+            outboxOldestEventId: String(oldestRecoveryRecord?.eventId || ""),
+            outboxNewestEventId: String(newestRecoveryRecord?.eventId || ""),
+            outboxEventGroups,
           };
         });
         // Keep reporting the local cache while offline, but do not consume or
@@ -1271,6 +1428,9 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
         if (!socketReady) return;
         if (recoveryRecords.length) outboxRecoveryHadRecordsRef.current = true;
         const pendingRecords = recoveryRecords.filter((record) => !outboxInFlightRef.current.has(record.packetId));
+        const sendableRecords = pendingRecords.filter((record) => (
+          Number(outboxRetryAfterRef.current.get(record.packetId) || 0) <= now
+        ));
         if (pendingRecords.length) {
           outboxEmptyPassesRef.current = 0;
         } else if (!recoveryRecords.length) {
@@ -1296,6 +1456,8 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
                   type: "live_backfill_complete",
                   room: LIVE_ROOM_ID,
                   eventId,
+                  cutoffSequence: recoveryCutoff,
+                  cutoffCapturedAt: recoveryCapturedAtCutoff,
                 }));
               }
               outboxBackfillAtByEventRef.current = new Map();
@@ -1307,19 +1469,13 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
           return;
         }
         let sent = 0;
-        const skippedPacketIds = [];
         const availableSlots = Math.min(
           OUTBOX_REPLAY_BATCH_SIZE,
           Math.max(0, OUTBOX_MAX_IN_FLIGHT - outboxInFlightRef.current.size),
         );
-        for (const record of pendingRecords) {
+        for (const record of sendableRecords) {
           const eventKey = String(record.eventId || "");
           const capturedAt = Number(record.capturedAt) || 0;
-          const lastBackfillAt = outboxBackfillAtByEventRef.current.get(eventKey) || 0;
-          if (lastBackfillAt && capturedAt - lastBackfillAt < OUTBOX_REPLAY_MIN_INTERVAL_MS) {
-            skippedPacketIds.push(record.packetId);
-            continue;
-          }
           if (sent >= availableSlots || socket.bufferedAmount > 256 * 1024) break;
           outboxBackfillAtByEventRef.current.set(eventKey, capturedAt);
           outboxInFlightRef.current.set(record.packetId, Date.now());
@@ -1336,8 +1492,14 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
           }));
           sent += 1;
         }
-        if (skippedPacketIds.length) await deleteCachedLivePacket(skippedPacketIds);
-        scheduleOutboxFlush(sent ? OUTBOX_REPLAY_INTERVAL_MS : 500);
+        const earliestRetryAt = pendingRecords.reduce(
+          (earliest, record) => Math.min(earliest, Number(outboxRetryAfterRef.current.get(record.packetId) || Infinity)),
+          Infinity,
+        );
+        const retryDelay = Number.isFinite(earliestRetryAt)
+          ? Math.min(5000, Math.max(500, earliestRetryAt - Date.now()))
+          : 500;
+        scheduleOutboxFlush(sent ? OUTBOX_REPLAY_INTERVAL_MS : retryDelay);
       } catch (error) {
         setLiveRelayState((current) => ({
           ...current,
@@ -1348,6 +1510,73 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
     }, Math.max(0, delayMs));
   }, [audience]);
 
+  const queueAcknowledgedOutboxDelete = useCallback((packetId) => {
+    if (!packetId) return;
+    outboxInFlightRef.current.set(packetId, Number.POSITIVE_INFINITY);
+    outboxAcknowledgedDeleteRef.current.add(packetId);
+    if (outboxAcknowledgedDeleteTimerRef.current) return;
+    outboxAcknowledgedDeleteTimerRef.current = window.setTimeout(() => {
+      outboxAcknowledgedDeleteTimerRef.current = 0;
+      const packetIds = [...outboxAcknowledgedDeleteRef.current];
+      outboxAcknowledgedDeleteRef.current.clear();
+      if (!packetIds.length) return;
+      void deleteCachedLivePacket(packetIds)
+        .then(() => {
+          for (const acknowledgedPacketId of packetIds) {
+            outboxInFlightRef.current.delete(acknowledgedPacketId);
+            outboxRetryAfterRef.current.delete(acknowledgedPacketId);
+            outboxOrphanedRef.current.delete(acknowledgedPacketId);
+          }
+          scheduleOutboxFlush(0);
+        })
+        .catch((error) => {
+          for (const acknowledgedPacketId of packetIds) outboxInFlightRef.current.delete(acknowledgedPacketId);
+          outboxRecoveringRef.current = true;
+          outboxRecoveryCutoffSequenceRef.current = Math.max(
+            Number(outboxRecoveryCutoffSequenceRef.current) || 0,
+            liveClientSequenceRef.current,
+          );
+          outboxRecoveryCutoffCapturedAtRef.current = Math.max(
+            Number(outboxRecoveryCutoffCapturedAtRef.current) || 0,
+            Date.now(),
+          );
+          const outboxError = `断网缓存批量确认失败，将重试：${error.message || "IndexedDB 删除失败"}`;
+          setLiveRelayState((current) => ({ ...current, outboxError }));
+          scheduleOutboxFlush(500);
+        });
+    }, 40);
+  }, [scheduleOutboxFlush]);
+
+  async function clearConfirmedOrphanedPackets() {
+    if (audience) return;
+    const packetIds = [...outboxOrphanedRef.current.keys()];
+    if (!packetIds.length) return;
+    const confirmed = window.confirm(
+      `确定清理 ${packetIds.length} 个已由服务器判定为孤儿的断网缓存包吗？\n\n该操作不会删除尚未确认或可以正常补传的数据，但删除后这些孤儿记录无法恢复。`,
+    );
+    if (!confirmed) return;
+    try {
+      await deleteCachedLivePacket(packetIds);
+      for (const packetId of packetIds) {
+        outboxInFlightRef.current.delete(packetId);
+        outboxRetryAfterRef.current.delete(packetId);
+        outboxOrphanedRef.current.delete(packetId);
+      }
+      setLiveRelayState((current) => ({
+        ...current,
+        outboxOrphaned: 0,
+        outboxOrphanReason: "",
+        outboxPending: Math.max(0, Number(current.outboxPending || 0) - packetIds.length),
+      }));
+      pushStatus(`已清理 ${packetIds.length} 个确认无归属的断网缓存包`);
+      scheduleOutboxFlush(0);
+    } catch (error) {
+      const outboxError = `孤儿缓存清理失败：${error.message || "IndexedDB 删除失败"}`;
+      setLiveRelayState((current) => ({ ...current, outboxError }));
+      pushStatus(outboxError);
+    }
+  }
+
   const publishLivePacket = useCallback((packet, capturedAt = Date.now()) => {
     if (audience) return;
     const now = performance.now();
@@ -1355,7 +1584,12 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
     liveRelayRef.current.minIntervalMs = minIntervalMs;
     liveRelayRef.current.lastSentAt = now;
     const batch = stripLocalSerialTelemetry(packet);
-    const activeEventId = eventsRef.current.find((event) => event.active)?.id || "";
+    const configuredActiveEventId = eventsRef.current.find((event) => event.active)?.id || "";
+    // Once the server has confirmed that an event no longer exists, never let
+    // stale React/event state keep creating new IndexedDB records for it.
+    const activeEventId = outboxDiscardedEventIdsRef.current.has(configuredActiveEventId)
+      ? ""
+      : configuredActiveEventId;
     const persistenceSample = persistenceSampleRef.current;
     const shouldSendDurableFrame = Boolean(activeEventId) && (
       persistenceSample.eventId !== activeEventId
@@ -1378,6 +1612,9 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
         }));
       }
     } else {
+      const previousPersistenceAt = persistenceSample.eventId === activeEventId
+        ? Number(persistenceSample.capturedAt || 0)
+        : Math.max(0, capturedAt - PERSISTENCE_SAMPLE_INTERVAL_MS);
       persistenceSample.eventId = activeEventId;
       persistenceSample.capturedAt = capturedAt;
       liveClientSequenceRef.current += 1;
@@ -1391,7 +1628,13 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       // Persist a per-receiver latest-value snapshot. The hardware protocol is
       // allowed to emit partial batches, so sampling the current serial packet
       // alone can starve receivers when several are connected.
-      const persistenceBatch = buildPersistenceSerialSnapshot(serialLatestRef.current, capturedAt) || batch;
+      const persistenceBatch = buildPersistenceSerialSnapshot(
+        serialLatestRef.current,
+        capturedAt,
+        undefined,
+        serialSamplesRef.current,
+        previousPersistenceAt,
+      ) || batch;
       const outgoing = {
         type: "live_batch",
         room: LIVE_ROOM_ID,
@@ -1406,22 +1649,26 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       outboxWriteChainRef.current = outboxWriteChainRef.current
         .catch(() => undefined)
         .then(async () => {
+          // This task may have been queued before the event_not_found ACK. Test
+          // again at execution time so an old write cannot land after cleanup.
+          if (outboxDiscardedEventIdsRef.current.has(activeEventId)) return "discarded";
           try {
             await cacheLivePacket({ packetId, eventId: activeEventId, clientSequence, capturedAt, batch: persistenceBatch });
             setLiveRelayState((current) => (
               current.outboxError ? { ...current, outboxError: "" } : current
             ));
-            return true;
+            return "cached";
           } catch (error) {
             const outboxError = `断网缓存写入失败：${error.message || "IndexedDB 不可用"}`;
             setLiveRelayState((current) => ({ ...current, outboxError }));
             pushStatus(outboxError);
-            return false;
+            return "failed";
           }
         })
-        .then((cached) => {
+        .then((cacheStatus) => {
+          if (cacheStatus === "discarded") return;
           const persistenceSocket = liveSocketRef.current;
-          if (!cached) {
+          if (cacheStatus !== "cached") {
             // Online persistence can still succeed, but explicitly avoid
             // claiming offline safety when the durable browser copy failed.
             if (persistenceSocket?.readyState === 1 && persistenceSocket.bufferedAmount <= 256 * 1024) {
@@ -1564,33 +1811,71 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
           if (streamChanged) setLiveSyncVersion((value) => value + 1);
         }
         if (!audience && message.type === "live_packet_ack" && message.packetId) {
-          if (message.accepted) {
-            // Keep the packet protected until the IndexedDB deletion really
-            // commits. Removing it from in-flight first creates a race where
-            // the recovery scanner sees the still-present record and resends
-            // it as backfill even though the network never disconnected.
-            void deleteCachedLivePacket(message.packetId)
-              .then(() => {
-                outboxInFlightRef.current.delete(message.packetId);
-                scheduleOutboxFlush(100);
-              })
-              .catch((error) => {
-                outboxInFlightRef.current.delete(message.packetId);
-                outboxRecoveringRef.current = true;
-                outboxRecoveryCutoffSequenceRef.current = Math.max(
-                  Number(outboxRecoveryCutoffSequenceRef.current) || 0,
-                  Number(message.clientSequence) || 0,
-                );
-                outboxRecoveryCutoffCapturedAtRef.current = Math.max(
-                  Number(outboxRecoveryCutoffCapturedAtRef.current) || 0,
-                  Date.now(),
-                );
-                const outboxError = `断网缓存确认失败，将重试：${error.message || "IndexedDB 删除失败"}`;
-                setLiveRelayState((current) => ({ ...current, outboxError }));
-                scheduleOutboxFlush(500);
-              });
+          if (shouldDeleteOutboxPacketForAck(message)) {
+            // Protect ACKed records immediately, then commit burst ACKs in one
+            // IndexedDB transaction. Per-packet delete transactions throttled
+            // recovery and could outlive the three-second watchdog.
+            queueAcknowledgedOutboxDelete(message.packetId);
           } else {
             outboxInFlightRef.current.delete(message.packetId);
+            if (shouldDiscardOrphanedOutboxPacket(message)) {
+              const missingEventId = message.reason === "event_not_found"
+                ? String(message.requestedEventId || "")
+                : "";
+              if (missingEventId) {
+                outboxDiscardedEventIdsRef.current.add(missingEventId);
+                if (!outboxDiscardCleanupInFlightRef.current.has(missingEventId)) {
+                  outboxDiscardCleanupInFlightRef.current.add(missingEventId);
+                  const writeFence = outboxWriteChainRef.current;
+                  void writeFence.catch(() => undefined)
+                    .then(() => deleteCachedLivePacketsByEventId(missingEventId))
+                    .then((deleted) => {
+                      for (const [packetId, orphan] of outboxOrphanedRef.current) {
+                        if (orphan.requestedEventId !== missingEventId) continue;
+                        outboxOrphanedRef.current.delete(packetId);
+                        outboxRetryAfterRef.current.delete(packetId);
+                      }
+                      if (deleted > 0) pushStatus(`已自动清理已删除事件 ${missingEventId} 的 ${deleted} 个断网缓存包`);
+                    })
+                    .catch((error) => {
+                      const retryDelay = outboxAckRetryDelay(message);
+                      outboxRetryAfterRef.current.set(message.packetId, Date.now() + retryDelay);
+                      outboxOrphanedRef.current.set(message.packetId, {
+                        reason: message.reason || "event_not_found",
+                        requestedEventId: missingEventId,
+                        capturedAt: message.capturedAt || null,
+                      });
+                      const outboxError = `已删除事件缓存批量清理失败：${error.message || "IndexedDB 删除失败"}`;
+                      setLiveRelayState((current) => ({ ...current, outboxError }));
+                      scheduleOutboxFlush(Math.min(5000, retryDelay));
+                    })
+                    .finally(() => {
+                      outboxDiscardCleanupInFlightRef.current.delete(missingEventId);
+                      scheduleOutboxFlush(0);
+                    });
+                }
+                return;
+              }
+              void deleteCachedLivePacket(message.packetId)
+                .then(() => {
+                  outboxRetryAfterRef.current.delete(message.packetId);
+                  outboxOrphanedRef.current.delete(message.packetId);
+                  scheduleOutboxFlush(50);
+                })
+                .catch((error) => {
+                  const retryDelay = outboxAckRetryDelay(message);
+                  outboxRetryAfterRef.current.set(message.packetId, Date.now() + retryDelay);
+                  outboxOrphanedRef.current.set(message.packetId, {
+                    reason: message.reason || "event_not_found",
+                    requestedEventId: message.requestedEventId || "",
+                    capturedAt: message.capturedAt || null,
+                  });
+                  const outboxError = `孤儿缓存自动清理失败：${error.message || "IndexedDB 删除失败"}`;
+                  setLiveRelayState((current) => ({ ...current, outboxError }));
+                  scheduleOutboxFlush(Math.min(5000, retryDelay));
+                });
+              return;
+            }
             outboxRecoveringRef.current = true;
             outboxRecoveryCutoffSequenceRef.current = Math.max(
               Number(outboxRecoveryCutoffSequenceRef.current) || 0,
@@ -1598,14 +1883,39 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
             );
             outboxRecoveryCutoffCapturedAtRef.current = Math.max(
               Number(outboxRecoveryCutoffCapturedAtRef.current) || 0,
-              Date.now(),
+              Number(message.capturedAt) || 0,
             );
-            scheduleOutboxFlush(500);
+            const retryDelay = outboxAckRetryDelay(message);
+            outboxRetryAfterRef.current.set(message.packetId, Date.now() + retryDelay);
+            scheduleOutboxFlush(Math.min(5000, retryDelay));
           }
         }
         if (audience && message.type === "live_resync_required") {
           audienceSequenceRef.current = Math.max(audienceSequenceRef.current, Number(message.latestSequence) || 0);
           setLiveSyncVersion((value) => value + 1);
+        }
+        if (message.type === "live_timeline_patch" && message.eventId) {
+          setLiveStateSeed((current) => {
+            const currentEventId = current?.event?.id || current?.eventId || "";
+            if (!current || (currentEventId && currentEventId !== message.eventId)) return current;
+            return {
+              ...current,
+              eventId: message.eventId,
+              updatedAt: Number(message.generatedAt || message.serverTime) || Date.now(),
+              receivedAt: Date.now(),
+              bandsByPilot: replaceLiveBandMapRange(
+                current.bandsByPilot || {},
+                message.bandsByPilot || {},
+                message.replaceFrom,
+                message.replaceTo,
+              ),
+              // The patch is applied to the complete join/REST baseline kept in
+              // memory, so the resulting map is again a complete authoritative
+              // view even if an earlier final-resync temporarily cleared the
+              // completeness marker.
+              bandsComplete: true,
+            };
+          });
         }
         if (message.type === "live_timeline_resync") {
           setLiveStateSeed((current) => {
@@ -1624,8 +1934,21 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
           const previousSequence = audienceSequenceRef.current;
           if (sequence && sequence <= previousSequence) return;
           if (sequence) audienceSequenceRef.current = sequence;
-          const line = JSON.stringify(message.batch);
-          updateSerialFromPacket(message.batch, line, message.sampleTime || message.serverTime || Date.now());
+          const sampleTime = Number(message.sampleTime || message.serverTime) || Date.now();
+          // TCP/WebSocket can deliver buffered frames in a burst after a brief
+          // outage. They belong in SQLite history, never in the current-stick
+          // display. Keep only a fresh latest frame for the next paint.
+          if (Date.now() - sampleTime > AUDIENCE_LIVE_STALE_MS) return;
+          audiencePendingBatchRef.current = { batch: message.batch, sampleTime };
+          if (!audienceBatchFrameRef.current) {
+            audienceBatchFrameRef.current = window.requestAnimationFrame(() => {
+              audienceBatchFrameRef.current = 0;
+              const pending = audiencePendingBatchRef.current;
+              audiencePendingBatchRef.current = null;
+              if (!pending || Date.now() - pending.sampleTime > AUDIENCE_LIVE_STALE_MS) return;
+              updateSerialFromPacket(pending.batch, JSON.stringify(pending.batch), pending.sampleTime);
+            });
+          }
         }
         if (!audience && message.type === "live_batch" && message.source === "virtual_receiver" && message.batch) {
           const capturedAt = message.sampleTime || message.serverTime || Date.now();
@@ -1757,10 +2080,17 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       stopped = true;
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       if (outboxFlushTimerRef.current) window.clearTimeout(outboxFlushTimerRef.current);
+      if (outboxAcknowledgedDeleteTimerRef.current) window.clearTimeout(outboxAcknowledgedDeleteTimerRef.current);
+      if (audienceBatchFrameRef.current) window.cancelAnimationFrame(audienceBatchFrameRef.current);
+      outboxFlushTimerRef.current = 0;
+      outboxFlushDueAtRef.current = 0;
+      outboxAcknowledgedDeleteTimerRef.current = 0;
+      audienceBatchFrameRef.current = 0;
+      audiencePendingBatchRef.current = null;
       liveSocketRef.current?.close();
       liveSocketRef.current = null;
     };
-  }, [audience, requestSerialRender, scheduleOutboxFlush, updateSerialFromPacket]);
+  }, [audience, queueAcknowledgedOutboxDelete, requestSerialRender, scheduleOutboxFlush, updateSerialFromPacket]);
 
   useEffect(() => {
     if (audience || !navigator.serial) return undefined;
@@ -2302,52 +2632,57 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
               }}
             >
               {csvWriteStatus && (
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(2,minmax(0,1fr))", gap: 6, marginBottom: 8, borderBottom: "1px solid #e5e7eb", paddingBottom: 8, fontSize: 12, color: "#475569" }}>
-                  <span>CSV 队列：{csvWriteStatus.queuedRows || 0} 行 / {formatBytes(csvWriteStatus.queuedBytes)}</span>
-                  <span>CSV 文件：{formatBytes(csvWriteStatus.fileSizeBytes)}</span>
-                  <span>已写：{csvWriteStatus.writtenRows || 0} 行</span>
-                  <span>最近写入：{csvWriteStatus.lastFlushMs || 0} ms</span>
-                  {csvWriteStatus.ingest && (
-                    <div style={{ gridColumn: "1 / -1", display: "grid", gap: 3, marginTop: 4, paddingTop: 7, borderTop: "1px dashed #cbd5e1" }}>
-                      <strong style={{ color: ingestStatusColor }}>
-                        服务器历史入库（约5Hz）：{ingestStatusText}
-                      </strong>
-                      <span>
-                        队列：当前 {csvWriteStatus.ingest.currentQueuedPackets || 0} / 回补 {csvWriteStatus.ingest.backfillQueuedPackets || 0} 包，最老 {csvWriteStatus.ingest.oldestQueuedMs || 0} ms；实时抽样合并 {csvWriteStatus.ingest.compactedCurrentPackets ?? csvWriteStatus.ingest.supersededPackets ?? 0} 包；回补抽样合并 {csvWriteStatus.ingest.compactedBackfillPackets || 0} 包；最近处理 {csvWriteStatus.ingest.lastProcessMs || 0} ms / 峰值 {csvWriteStatus.ingest.maxProcessMs || 0} ms
-                      </span>
-                      <span>
-                        最近当前包落库 {csvWriteStatus.ingest.lastPacketPersistedSamples ?? "-"}/{csvWriteStatus.ingest.lastPacketMappedSamples || 0} 路；限频 {csvWriteStatus.ingest.lastPacketThrottledSamples || 0} 路；旧包 {csvWriteStatus.ingest.lastPacketStaleSamples || 0} 路；未分配 {csvWriteStatus.ingest.lastPacketUnmappedSamples || 0} 路；超出训练时间 {csvWriteStatus.ingest.lastPacketOutOfWindowSamples || 0} 路
-                      </span>
-                      <span>
-                        回补累计处理 {csvWriteStatus.ingest.backfillProcessedPackets || 0} 包 / 落库 {csvWriteStatus.ingest.backfillPersistedSamples || 0} 路；最近回补 {csvWriteStatus.ingest.lastBackfillProcessedAt ? formatStatusLogTime(csvWriteStatus.ingest.lastBackfillProcessedAt) : "无"}；最近重建 {csvWriteStatus.ingest.lastBackfillFinalizedAt ? formatStatusLogTime(csvWriteStatus.ingest.lastBackfillFinalizedAt) : "无"}
-                      </span>
-                      <span>
-                        回补跳过：限频 {csvWriteStatus.ingest.backfillThrottledSamples || 0} 路；旧包 {csvWriteStatus.ingest.backfillStaleSamples || 0} 路；未分配 {csvWriteStatus.ingest.backfillUnmappedSamples || 0} 路；超出训练时间 {csvWriteStatus.ingest.backfillOutOfWindowSamples || 0} 路；事件不存在 {csvWriteStatus.ingest.backfillMissingEventPackets || 0} 包；重复包 {csvWriteStatus.ingest.backfillDuplicatePackets || 0} 包
-                      </span>
-                    </div>
-                  )}
+                <div style={{ display: "grid", gap: 7, marginBottom: 8, borderBottom: "1px solid #e5e7eb", paddingBottom: 8, fontSize: 12, color: "#475569" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                    <strong style={{ color: ingestStatusColor }}>历史入库：{ingestStatusText}</strong>
+                    <span>当前 {ingest?.lastPacketPersistedSamples ?? "-"}/{ingest?.lastPacketMappedSamples || 0} 路 · 队列 {ingest?.currentQueuedPackets || 0}/{ingest?.backfillQueuedPackets || 0}</span>
+                  </div>
                   {!audience && (
-                    <div style={{ gridColumn: "1 / -1", display: "grid", gap: 3, marginTop: 4, paddingTop: 7, borderTop: "1px dashed #cbd5e1" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
                       <strong style={{ color: liveRelayState.outboxError ? "#b91c1c" : liveRelayState.outboxRecovering ? "#b45309" : "#15803d" }}>
-                        浏览器断网缓存：{liveRelayState.outboxError
+                        本地缓存：{liveRelayState.outboxError
                           || (liveRelayState.outboxRecovering
-                            ? `回补中，当前可见 ${liveRelayState.outboxPendingMore ? "至少 " : ""}${liveRelayState.outboxPending || 0} 包`
-                            : "已启用")}
+                            ? `${liveRelayState.outboxOldestEventId
+                              && liveRelayState.outboxNewestEventId
+                              && liveRelayState.outboxOldestEventId !== liveRelayState.outboxActiveEventId
+                              && liveRelayState.outboxNewestEventId !== liveRelayState.outboxActiveEventId
+                              ? "清理旧事件缓存"
+                              : "恢复中"} ${liveRelayState.outboxPendingMore ? "至少 " : ""}${liveRelayState.outboxPending || 0} 包`
+                            : "正常")}
                       </strong>
-                      <span>超过 {OUTBOX_ACK_TIMEOUT_MS / 1000} 秒未收到服务器 ACK 会自动重发；此状态来自教练端 IndexedDB，不依赖服务器在线。</span>
+                      <span>累计恢复 {ingest?.backfillProcessedPackets || 0} 包 · 渐进 {ingest?.backfillProgressPublishCount || 0} 次 · 校准 {ingest?.backfillFinalizedCount || 0} 次</span>
                     </div>
                   )}
                   {csvWriteStatus.audienceDownload && (
-                    <div style={{ gridColumn: "1 / -1", display: "grid", gap: 3, marginTop: 4, paddingTop: 7, borderTop: "1px dashed #cbd5e1" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
                       <strong style={{ color: audiencePressureColor(csvWriteStatus.audienceDownload.pressureLevel) }}>
-                        观众下载压力：{audiencePressureText(csvWriteStatus.audienceDownload.pressureLevel)} · {csvWriteStatus.audienceDownload.audienceCount || 0} 人 · {formatBitRate(csvWriteStatus.audienceDownload.bitsPerSecond)} / {Number(csvWriteStatus.audienceDownload.capacityMbps || 3).toFixed(1)} Mbps（{Math.round(csvWriteStatus.audienceDownload.utilizationPercent || 0)}%）
+                        观众压力：{audiencePressureText(csvWriteStatus.audienceDownload.pressureLevel)} · {csvWriteStatus.audienceDownload.audienceCount || 0} 人
                       </strong>
-                      <span>
-                        实时上限：{csvWriteStatus.audienceDownload.targetLiveFps || 30} Hz/人；连接积压：{formatBytes(csvWriteStatus.audienceDownload.bufferedBytes)}；丢弃旧帧 {csvWriteStatus.audienceDownload.skippedMessages || 0} 包
-                      </span>
+                      <span>{formatBitRate(csvWriteStatus.audienceDownload.bitsPerSecond)} · 积压 {formatBytes(csvWriteStatus.audienceDownload.bufferedBytes)}</span>
                     </div>
                   )}
-                  {csvWriteStatus.lastError && <span style={{ gridColumn: "1 / -1", color: "#b91c1c" }}>{csvWriteStatus.lastError}</span>}
+                  {liveRelayState.outboxOrphaned > 0 && !audience && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", color: "#b91c1c" }}>
+                      <span>孤儿缓存清理失败 {liveRelayState.outboxOrphaned} 包</span>
+                      <button type="button" onClick={() => { void clearConfirmedOrphanedPackets(); }} style={{ ...buttonStyle, minHeight: 28, padding: "4px 10px", color: "#b91c1c", borderColor: "#fecaca" }}>
+                        手动清理
+                      </button>
+                    </div>
+                  )}
+                  {csvWriteStatus.lastError && <span style={{ color: "#b91c1c" }}>{csvWriteStatus.lastError}</span>}
+                  <details style={{ borderTop: "1px dashed #cbd5e1", paddingTop: 6 }}>
+                    <summary style={{ cursor: "pointer", color: "#475569", fontWeight: 800 }}>数据链路详情</summary>
+                    <div style={{ display: "grid", gap: 4, marginTop: 7, overflowWrap: "anywhere" }}>
+                      <span>CSV：队列 {csvWriteStatus.queuedRows || 0} 行 / {formatBytes(csvWriteStatus.queuedBytes)}；文件 {formatBytes(csvWriteStatus.fileSizeBytes)}；已写 {csvWriteStatus.writtenRows || 0} 行；最近 {csvWriteStatus.lastFlushMs || 0} ms</span>
+                      <span>入库：队列最老 {ingest?.oldestQueuedMs || 0} ms；实时合并 {ingest?.compactedCurrentPackets ?? ingest?.supersededPackets ?? 0} 包；处理 {ingest?.lastProcessMs || 0}/{ingest?.maxProcessMs || 0} ms</span>
+                      <span>恢复：落库 {ingest?.backfillPersistedSamples || 0} 路；重复 {ingest?.backfillDuplicatePackets || 0}；孤儿 {ingest?.backfillOrphanedPackets || 0}；渐进计算 {ingest?.lastBackfillProgressMs || 0}/{ingest?.maxBackfillProgressMs || 0} ms；最终校准 {ingest?.lastBackfillFinalizeMs || 0}/{ingest?.maxBackfillFinalizeMs || 0} ms</span>
+                      <span style={{ color: Number(ingest?.lastTimelineGapCount || 0) > 0 ? "#b91c1c" : "#475569" }}>最终样本：{ingest?.lastTimelineSampleCount || 0} 路；超过1秒缺口 {ingest?.lastTimelineGapCount || 0} 个；最大间隔 {ingest?.lastTimelineMaxGapMs || 0} ms</span>
+                      <span>最近恢复：{ingest?.lastBackfillProcessedAt ? formatStatusLogTime(ingest.lastBackfillProcessedAt) : "无"}；ACK {ingest?.lastBackfillAckStatus || "-"}；采集 {ingest?.lastBackfillCapturedAt ? formatStatusLogTime(ingest.lastBackfillCapturedAt) : "-"}；原因 {ingest?.lastBackfillRejectReason || "无"}</span>
+                      <span>事件：请求 {ingest?.lastBackfillRequestedEventId || "-"}；活动 {ingest?.lastBackfillActiveEventId || "-"}；解析 {ingest?.lastBackfillEventId || "-"}（{ingest?.lastBackfillResolvedBy || "未解析"}）</span>
+                      {!audience && <span>缓存事件：{liveRelayState.outboxEventGroups || "无"}；3秒未收到ACK自动重发。</span>}
+                      {csvWriteStatus.audienceDownload && <span>观众：上限 {csvWriteStatus.audienceDownload.targetLiveFps || 30} Hz/人；丢弃旧帧 {csvWriteStatus.audienceDownload.skippedMessages || 0} 包；容量 {Number(csvWriteStatus.audienceDownload.capacityMbps || 3).toFixed(1)} Mbps。</span>}
+                    </div>
+                  </details>
                 </div>
               )}
               {statusLog.map((item) => (
@@ -2439,16 +2774,38 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
         if (!updatedEvent?.id) return;
         setEvents((current) => {
           const nextEvents = current.map((event) => (event.id === updatedEvent.id ? updatedEvent : event));
+          eventsRef.current = nextEvents;
           publishTrainingState(nextEvents);
           return nextEvents;
         });
       }} onDeleteEvent={async (eventId) => {
+        outboxDiscardedEventIdsRef.current.add(String(eventId || ""));
         setEvents((current) => {
           const nextEvents = current.filter((event) => event.id !== eventId);
+          eventsRef.current = nextEvents;
           publishTrainingState(nextEvents);
           return nextEvents;
         });
-        pushStatus("历史事件已删除");
+        try {
+          // The server delete has already succeeded. Wait for every local write
+          // that was queued before the click, then remove this event in one
+          // IndexedDB transaction so no stale packet survives into the next
+          // training event.
+          await outboxWriteChainRef.current.catch(() => undefined);
+          const deleted = await deleteCachedLivePacketsByEventId(eventId);
+          for (const [packetId, orphan] of outboxOrphanedRef.current) {
+            if (String(orphan?.requestedEventId || "") !== String(eventId || "")) continue;
+            outboxInFlightRef.current.delete(packetId);
+            outboxRetryAfterRef.current.delete(packetId);
+            outboxOrphanedRef.current.delete(packetId);
+          }
+          scheduleOutboxFlush(0);
+          pushStatus(`历史事件已删除，本地缓存同步清理 ${deleted} 包`);
+        } catch (error) {
+          const outboxError = `历史事件已删除，但本地缓存清理失败：${error.message || "IndexedDB 删除失败"}`;
+          setLiveRelayState((current) => ({ ...current, outboxError }));
+          pushStatus(outboxError);
+        }
       }} />}
     </div>
   );

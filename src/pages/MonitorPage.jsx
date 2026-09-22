@@ -1177,7 +1177,7 @@ function CoachTaskList({ eventId, eventStart, clock, audience = false }) {
   );
 }
 
-const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, participant, eventStart, windowStart, windowMs, latestSamplesRef, sampleQueuesRef, renderTick, stateSeed, onLiveStateChange, cardRef }) {
+const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, participant, eventStart, windowStart, windowMs, timelineNow, latestSamplesRef, sampleQueuesRef, renderTick, stateSeed, onLiveStateChange, cardRef }) {
   const samplesRef = useRef([]);
   const bandsRef = useRef([]);
   const authoritativeBandsRef = useRef([]);
@@ -1282,23 +1282,39 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
     }
 
     frameId = window.requestAnimationFrame(() => {
+      const previousSamples = samplesRef.current;
+      const previousLatest = previousSamples[previousSamples.length - 1] || null;
+      const restoredLatest = restored[restored.length - 1] || null;
+      const retainedSamples = Number(previousLatest?.time || 0) > Number(restoredLatest?.time || 0)
+        ? previousSamples
+        : restored;
+      const retainedLiveTail = mergeAuthoritativeBandsWithLiveTail(restoredLiveTail, bandsRef.current);
       lastSeededBandsRef.current = seededBands;
-      samplesRef.current = restored.length ? getRecentSamples(restored, Date.now() - RECENT_SAMPLE_WINDOW_MS) : [];
+      samplesRef.current = retainedSamples.length
+        ? getRecentSamples(retainedSamples, Date.now() - RECENT_SAMPLE_WINDOW_MS)
+        : [];
       if (seededBands.length) authoritativeBandsRef.current = seededBands;
       // Keep the persisted timeline and the unpersisted live tail separate.
       // This is the stable merge model and prevents refresh reconstruction
       // from duplicating/reordering nearby bands.
-      bandsRef.current = restoredLiveTail;
+      // A heartbeat received after input stops must not erase the local tail
+      // that was already painted but has not reached SQLite yet.
+      bandsRef.current = retainedLiveTail;
       summaryRef.current = nextSummaryRef;
-      lastSerialTimeRef.current = restored[restored.length - 1]?.time || 0;
+      lastSerialTimeRef.current = Math.max(
+        Number(lastSerialTimeRef.current) || 0,
+        Number(restoredLatest?.time) || 0,
+      );
       const nowTime = Date.now();
       setView((current) => ({
         ...current,
         bands: authoritativeBands.length
-          ? mergeAuthoritativeBandsWithLiveTail(authoritativeBands, restoredLiveTail)
-          : restoredLiveTail,
-        latest: restored[restored.length - 1] || current.latest,
-        recent: getRecentSamples(restored, nowTime - 5000),
+          ? mergeAuthoritativeBandsWithLiveTail(authoritativeBands, retainedLiveTail)
+          : retainedLiveTail,
+        latest: Number(restoredLatest?.time || 0) >= Number(current.latest?.time || 0)
+          ? restoredLatest || current.latest
+          : current.latest,
+        recent: getRecentSamples(retainedSamples, nowTime - 5000),
         now: nowTime,
         waveNow: nowTime,
         summary: nextSummary || current.summary,
@@ -1370,7 +1386,7 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
 
   useEffect(() => {
     const frameId = window.requestAnimationFrame(() => {
-      const nowTime = Date.now();
+      const nowTime = Number(timelineNow) || Date.now();
       const externalSample = latestSamplesRef?.current?.[participant.receiverId] || null;
       const queuedSamples = sampleQueuesRef?.current?.[participant.receiverId] || [];
       const pendingSamples = queuedSamples.filter((sample) => Number(sample?.time) > lastSerialTimeRef.current);
@@ -1385,7 +1401,6 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
         changed = changed || result.changed;
         stateChanged = stateChanged || result.stateChanged;
       }
-      const latestProcessedSample = samplesRef.current[samplesRef.current.length - 1] || externalSample;
       const shouldRefreshSummary = changed || nowTime - lastSummaryAtRef.current >= STATS_INTERVAL_MS;
       const shouldRefreshBands = changed && (stateChanged || nowTime - lastBandRenderAtRef.current >= BAND_RENDER_INTERVAL_MS);
       const summary = shouldRefreshSummary ? buildSummary(nowTime) : null;
@@ -1400,12 +1415,14 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
         // next can straddle a second boundary and make mobile Edge alternate
         // repeatedly between (for example) 1 s and 2 s.
         now: nowTime,
-        waveNow: shouldRefreshBands ? Number(latestProcessedSample?.time) || nowTime : current.waveNow,
+        // The cursor represents wall time, not the timestamp of the last radio
+        // sample. When input disappears it must keep moving across a white gap.
+        waveNow: nowTime,
         summary: summary || current.summary,
       }));
     });
     return () => window.cancelAnimationFrame(frameId);
-  }, [buildSummary, latestSamplesRef, participant.receiverId, processExternalSample, renderTick, sampleQueuesRef, windowStart, windowMs]);
+  }, [buildSummary, latestSamplesRef, participant.receiverId, processExternalSample, renderTick, sampleQueuesRef, timelineNow, windowStart, windowMs]);
 
   const latest = view.latest || {};
   const recent = view.recent || [];
@@ -1508,7 +1525,7 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
         <MetricBadge label="距上次" value={idleDisplay} />
         <MetricBadge label="反乌龟" value={formatDuration(summary.totalTurtleMs)} tone="#c2410c" />
       </div>
-      <Waveform bands={view.bands} windowStart={windowStart} windowMs={windowMs} currentTime={view.waveNow} />
+      <Waveform bands={view.bands} windowStart={windowStart} windowMs={windowMs} currentTime={Math.max(Number(view.waveNow) || 0, Number(timelineNow) || 0)} />
 
       <div style={{ display: "flex", gap: 18, flexWrap: "wrap", alignItems: "center", justifyContent: "center", marginTop: 16, maxWidth: "100%", minWidth: 0 }}>
         <div style={{ display: "flex", gap: 18, flexWrap: "wrap", alignItems: "center", justifyContent: "center", maxWidth: "100%", minWidth: 0 }}>
@@ -1791,6 +1808,7 @@ export default function MonitorPage({ pilots, events, latestSamplesRef, sampleQu
             eventStart={eventStart}
             windowStart={windowStart}
             windowMs={windowMs}
+            timelineNow={clock}
             latestSamplesRef={latestSamplesRef}
             sampleQueuesRef={sampleQueuesRef}
             renderTick={renderTick || clock}

@@ -7,6 +7,30 @@ export function shouldSendCurrentPersistence(socketReadyState, recoveryActive = 
   void recoveryActive;
   return socketReadyState === 1;
 }
+
+const OUTBOX_SUCCESS_ACK_STATUSES = new Set(["persisted", "processed", "duplicate"]);
+
+export function shouldDeleteOutboxPacketForAck(message) {
+  const status = String(message?.status || "");
+  if (status) return OUTBOX_SUCCESS_ACK_STATUSES.has(status);
+  // Compatibility with a rolling deployment where the browser can reconnect
+  // to an older server that only returned the accepted boolean.
+  return message?.accepted === true;
+}
+
+export function shouldDiscardOrphanedOutboxPacket(message) {
+  return String(message?.status || "") === "orphaned"
+    || message?.orphaned === true
+    || message?.rejected === true;
+}
+
+export function outboxAckRetryDelay(message) {
+  const status = String(message?.status || "");
+  if (status === "orphaned" || message?.orphaned || message?.rejected) {
+    return Math.max(30_000, Number(message?.retryAfterMs) || 0);
+  }
+  return Math.max(500, Number(message?.retryAfterMs) || 1000);
+}
 // A reconnect captures the last sequence that existed before the socket came
 // back. Only that frozen generation belongs to historical recovery; newer
 // online packets must not keep the completion condition open forever.
@@ -41,16 +65,53 @@ function compactLatestSample(sample) {
   return item;
 }
 
-// The receiver hub may deliver one receiver, a subset, or the whole array in a
-// serial frame. History sampling therefore has to be per receiver rather than
-// selecting one arbitrary serial frame every 200 ms. This snapshot keeps the
-// newest recent value for every receiver while the 30 Hz relay stays untouched.
-export function buildPersistenceSerialSnapshot(latestByReceiver, capturedAt = Date.now(), recentSampleMs = DEFAULT_RECENT_SAMPLE_MS) {
+// PROTECTED PIPELINE BOUNDARY (docs/LIVE_DATA_PIPELINE.md): the receiver hub
+// may deliver one receiver, a subset, or the whole array in a serial frame.
+// History sampling therefore has to be per receiver rather than selecting one
+// arbitrary frame every 200 ms. Keep this as raw receiver evidence inside the
+// existing durable frame; never upload browser-derived flight state or create
+// a second online persistence stream. The 30 Hz relay stays untouched.
+export function buildPersistenceSerialSnapshot(
+  latestByReceiver,
+  capturedAt = Date.now(),
+  recentSampleMs = DEFAULT_RECENT_SAMPLE_MS,
+  samplesByReceiver = null,
+  windowStartedAt = capturedAt,
+) {
   const items = Object.values(latestByReceiver || {})
     .filter((sample) => capturedAt - Number(sample?.time || 0) <= recentSampleMs)
-    .map(compactLatestSample)
+    .map((sample) => compactLatestSample(sample))
     .filter(Boolean)
     .sort((left, right) => left.rx - right.rx);
   if (!items.length) return null;
-  return { type: "rx_batch", v: 1, t: capturedAt, items };
+  const itemReceiverIds = new Set(items.map((item) => item.rx));
+  const history = [];
+  for (const [receiverKey, queuedSamples] of Object.entries(samplesByReceiver || {})) {
+    const receiverId = Number(receiverKey);
+    if (!itemReceiverIds.has(receiverId) || !Array.isArray(queuedSamples)) continue;
+    const candidates = queuedSamples.filter((sample) => (
+      Number(sample?.time) > Number(windowStartedAt || 0)
+      && Number(sample?.time) <= capturedAt
+      && Number(sample?.receiverId) === receiverId
+      && Array.isArray(sample?.rawChannels)
+      && Number.isFinite(Number(sample.rawChannels[2]))
+    ));
+    if (!candidates.length) continue;
+    let lowest = candidates[0];
+    let highest = candidates[0];
+    for (const sample of candidates.slice(1)) {
+      if (Number(sample.rawChannels[2]) < Number(lowest.rawChannels[2])) lowest = sample;
+      if (Number(sample.rawChannels[2]) > Number(highest.rawChannels[2])) highest = sample;
+    }
+    const compactLowest = compactLatestSample(lowest);
+    const compactHighest = compactLatestSample(highest);
+    if (compactLowest) history.push(compactLowest);
+    if (compactHighest && highest !== lowest) history.push(compactHighest);
+  }
+  const snapshot = { type: "rx_batch", v: 1, t: capturedAt, items };
+  // These are real receiver samples, not browser-derived flight state. Two
+  // extrema per receiver losslessly preserve everything the server needs for
+  // its five-second throttle-spread rule without turning SQLite into 30 Hz.
+  if (history.length) snapshot.history = history;
+  return snapshot;
 }

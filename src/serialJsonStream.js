@@ -1,4 +1,9 @@
 const DEFAULT_MAX_BUFFER_LENGTH = 256 * 1024;
+const TOP_LEVEL_PACKET_START = /^\{\s*"type"\s*:\s*"rx_batch"/;
+
+function isTopLevelPacketStart(source, index) {
+  return source[index] === "{" && TOP_LEVEL_PACKET_START.test(source.slice(index, index + 64));
+}
 
 // Web Serial chunks and device print calls are not message boundaries. A
 // single rx_batch may contain embedded newlines or arrive over several reads,
@@ -23,6 +28,21 @@ export function consumeSerialJsonStream(previousBuffer = "", chunk = "", maxBuff
         inString = false;
         escaped = false;
       }
+      continue;
+    }
+
+    // If USB/browser buffering drops the tail of one object, brace depth can
+    // never return to zero and every later valid packet used to be trapped
+    // behind that fragment until the 256 KiB emergency limit was reached.
+    // rx_batch is the only top-level typed serial frame. Its unescaped header
+    // cannot occur inside a valid JSON string (there the quotes are escaped),
+    // so it also recovers a previous frame truncated halfway through a key.
+    if (index > frameStart && isTopLevelPacketStart(source, index)) {
+      failures.push(source.slice(frameStart, index));
+      frameStart = index;
+      depth = 1;
+      inString = false;
+      escaped = false;
       continue;
     }
 

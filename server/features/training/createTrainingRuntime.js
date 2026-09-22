@@ -9,6 +9,7 @@ export function createTrainingRuntime({
   receiverOfflineAfterMs, recentSampleWindowMs, runtimeEvents, sampleChannelValue,
   sampleWriteIntervalMs, serialIngestStatus, serialPersistenceMaxPacketsPerTick,
   serialPersistenceTimeBudgetMs, sendLiveSocketJson, serverLiveState, statsRefreshIntervalMs,
+  onBackfillResult = () => {},
   trainingCsvFile, trainingCsvStatus,
 }) {
 let lastReceiverOfflineMarkAt = 0;
@@ -42,6 +43,17 @@ const activeEventQuery = db.prepare(`
   LIMIT 1
 `);
 const eventByIdQuery = db.prepare("SELECT * FROM training_events WHERE id = ?");
+const eventsCoveringTimeQuery = db.prepare(`
+  SELECT *
+  FROM training_events
+  WHERE started_at IS NOT NULL
+    AND started_at <= ?
+    AND (
+      (ended_at IS NOT NULL AND ended_at >= ?)
+      OR (active = 1 AND ended_at IS NULL)
+    )
+  ORDER BY started_at DESC, created_at DESC
+`);
 const receiverAssignmentsQuery = db.prepare(`
   SELECT pilot_id, receiver_id, started_at, ended_at
   FROM training_receiver_assignments
@@ -175,6 +187,21 @@ const latestTwoSamplesQuery = db.prepare(`
   WHERE event_id = ? AND pilot_id = ?
   ORDER BY time DESC, id DESC
   LIMIT 2
+`);
+const timelinePatchSamplesQuery = db.prepare(`
+  SELECT pilot_id, time, flying, turtle
+  FROM training_samples
+  WHERE event_id = ? AND time >= ? AND time <= ?
+  ORDER BY pilot_id ASC, time ASC, id ASC
+`);
+const historicalStateContextQuery = db.prepare(`
+  SELECT time, ch1, ch2, ch3, ch4, ch5, ch6, ch7, ch8, throttle_min, throttle_max
+  FROM training_samples
+  WHERE event_id = ?
+    AND pilot_id = ?
+    AND time >= ?
+    AND time < ?
+  ORDER BY time ASC, id ASC
 `);
 const coveringSegmentQuery = db.prepare(`
   SELECT 1
@@ -626,8 +653,38 @@ function persistProcessedSample(event, pilot, participant, rawSample, runtime, r
   if (sampleTime < eventStart || (eventEnd && sampleTime > eventEnd)) {
     return { sample: null, persisted: false, skipReason: "out_of_window", sampleTime };
   }
-  const recentBefore = (runtime.recentByPilot.get(pilotId) || [])
-    .filter((sample) => sample.time <= sampleTime && sample.time >= sampleTime - RECENT_SAMPLE_WINDOW_MS);
+  // Current packets can use the event runtime's rolling window. Historical
+  // packets cannot: current live traffic is interleaved with recovery, so that
+  // in-memory window mostly contains samples from "now" and is empty when
+  // filtered back to the old capture time. Rebuild the same five-second input
+  // window from SQLite instead, keeping the server as the sole state authority.
+  const recentBefore = backfill
+    ? historicalStateContextQuery.all(
+      event.id,
+      pilotId,
+      sampleTime - RECENT_SAMPLE_WINDOW_MS,
+      sampleTime,
+    ).map((row) => ({
+      time: Number(row.time),
+      channels: {
+        ch1: Number(row.ch1),
+        ch2: Number(row.ch2),
+        ch3: Number(row.ch3),
+        ch4: Number(row.ch4),
+        ch5: Number(row.ch5),
+        ch6: Number(row.ch6),
+        ch7: Number(row.ch7),
+        ch8: Number(row.ch8),
+      },
+      throttleMin: row.throttle_min !== null && Number.isFinite(Number(row.throttle_min))
+        ? Number(row.throttle_min)
+        : Number(row.ch3),
+      throttleMax: row.throttle_max !== null && Number.isFinite(Number(row.throttle_max))
+        ? Number(row.throttle_max)
+        : Number(row.ch3),
+    }))
+    : (runtime.recentByPilot.get(pilotId) || [])
+      .filter((sample) => sample.time <= sampleTime && sample.time >= sampleTime - RECENT_SAMPLE_WINDOW_MS);
   const baseSample = { ...rawSample, pilotId, receiverId, time: sampleTime };
   const state = getPilotState(pilot, baseSample, [...recentBefore, baseSample]);
   const sample = {
@@ -642,10 +699,12 @@ function persistProcessedSample(event, pilot, participant, rawSample, runtime, r
 
   recentBefore.push(sample);
   runtime.recentByPilot.set(pilotId, recentBefore.slice(-120));
-  serverLiveState.latestSamplesByReceiver[receiverId] = {
-    ...sample,
-    serverSeenAt: serverLiveState.latestSamplesByReceiver[receiverId]?.serverSeenAt || Date.now(),
-  };
+  if (!backfill) {
+    serverLiveState.latestSamplesByReceiver[receiverId] = {
+      ...sample,
+      serverSeenAt: serverLiveState.latestSamplesByReceiver[receiverId]?.serverSeenAt || Date.now(),
+    };
+  }
 
   let previous = getLastPersistedSample(runtime, event.id, pilotId);
   if (!backfill && previous && sampleTime <= previous.time) {
@@ -674,6 +733,8 @@ function persistProcessedSample(event, pilot, participant, rawSample, runtime, r
         sampleChannelValue(sample, "ch6"),
         sampleChannelValue(sample, "ch7"),
         sampleChannelValue(sample, "ch8"),
+        Number.isFinite(Number(sample.throttleMin)) ? Number(sample.throttleMin) : sampleChannelValue(sample, "ch3"),
+        Number.isFinite(Number(sample.throttleMax)) ? Number(sample.throttleMax) : sampleChannelValue(sample, "ch3"),
         sample.armed ? 1 : 0,
         sample.flying ? 1 : 0,
         sample.turtle ? 1 : 0,
@@ -703,6 +764,8 @@ function persistProcessedSample(event, pilot, participant, rawSample, runtime, r
     sampleChannelValue(sample, "ch6"),
     sampleChannelValue(sample, "ch7"),
     sampleChannelValue(sample, "ch8"),
+    Number.isFinite(Number(sample.throttleMin)) ? Number(sample.throttleMin) : sampleChannelValue(sample, "ch3"),
+    Number.isFinite(Number(sample.throttleMax)) ? Number(sample.throttleMax) : sampleChannelValue(sample, "ch3"),
     sample.armed ? 1 : 0,
     sample.flying ? 1 : 0,
     sample.turtle ? 1 : 0,
@@ -754,6 +817,8 @@ function rebuildEventTimelineFromSamples(eventId, now = Date.now(), { force = fa
   const participants = new Map((event.participants || []).map((participant) => [participant.pilotId, participant]));
   const rebuiltSegments = [];
   const rebuiltStats = [];
+  let timelineGapCount = 0;
+  let timelineMaxGapMs = 0;
 
   for (const [pilotId, participant] of participants) {
     const samples = samplesByPilot.get(pilotId) || [];
@@ -786,6 +851,9 @@ function rebuildEventTimelineFromSamples(eventId, now = Date.now(), { force = fa
       const next = samples[index + 1];
       const startedAt = Number(sample.time) || 0;
       const endedAt = Number(next.time) || 0;
+      const sampleGapMs = endedAt > startedAt ? endedAt - startedAt : 0;
+      timelineMaxGapMs = Math.max(timelineMaxGapMs, sampleGapMs);
+      if (sampleGapMs > MAX_SAMPLE_GAP_MS) timelineGapCount += 1;
       if (!startedAt || endedAt <= startedAt || endedAt - startedAt > MAX_SAMPLE_GAP_MS) {
         closeSegment();
         continue;
@@ -808,6 +876,11 @@ function rebuildEventTimelineFromSamples(eventId, now = Date.now(), { force = fa
       lastFlightEndAt,
     });
   }
+
+  serialIngestStatus.lastTimelineGapEventId = eventId;
+  serialIngestStatus.lastTimelineSampleCount = rows.length;
+  serialIngestStatus.lastTimelineGapCount = timelineGapCount;
+  serialIngestStatus.lastTimelineMaxGapMs = timelineMaxGapMs;
 
   db.exec("BEGIN");
   try {
@@ -843,6 +916,66 @@ function rebuildEventTimelineFromSamples(eventId, now = Date.now(), { force = fa
   }
   runtimeEvents.delete(eventId);
   return true;
+}
+
+function buildEventTimelinePatch(eventId, replaceFrom, replaceTo) {
+  const eventRow = eventByIdQuery.get(eventId);
+  if (!eventRow) return null;
+  const event = eventFromRow(eventRow);
+  const eventStart = Number(event.startedAt || event.createdAt) || 0;
+  const eventEnd = Number(event.endedAt) || Number.MAX_SAFE_INTEGER;
+  const safeFrom = Math.max(eventStart, Number(replaceFrom) || 0);
+  const safeTo = Math.min(eventEnd, Number(replaceTo) || 0);
+  if (!safeFrom || safeTo <= safeFrom) return null;
+
+  // One sample on either side is enough to reconstruct every interval that can
+  // legally cross the replacement boundary (intervals over MAX_SAMPLE_GAP_MS
+  // are intentionally rendered as gaps).
+  const rows = timelinePatchSamplesQuery.all(
+    eventId,
+    Math.max(eventStart, safeFrom - MAX_SAMPLE_GAP_MS),
+    Math.min(eventEnd, safeTo + MAX_SAMPLE_GAP_MS),
+  );
+  const rowsByPilot = new Map();
+  for (const row of rows) {
+    const samples = rowsByPilot.get(row.pilot_id) || [];
+    samples.push(row);
+    rowsByPilot.set(row.pilot_id, samples);
+  }
+
+  const bandsByPilot = {};
+  const pilotIds = new Set((event.participants || []).map((participant) => participant.pilotId).filter(Boolean));
+  for (const pilotId of pilotIds) {
+    const samples = rowsByPilot.get(pilotId) || [];
+    const bands = [];
+    for (let index = 0; index < samples.length - 1; index += 1) {
+      const sample = samples[index];
+      const next = samples[index + 1];
+      const sampleTime = Number(sample.time) || 0;
+      const nextTime = Number(next.time) || 0;
+      if (!sampleTime || nextTime <= sampleTime || nextTime - sampleTime > MAX_SAMPLE_GAP_MS) continue;
+      const start = Math.max(safeFrom, sampleTime);
+      const end = Math.min(safeTo, nextTime);
+      if (end <= start) continue;
+      const state = sample.turtle ? "turtle" : sample.flying ? "flying" : "idle";
+      const previous = bands[bands.length - 1];
+      if (previous && previous.state === state && start - previous.end <= MAX_SAMPLE_GAP_MS) {
+        previous.end = Math.max(previous.end, end);
+      } else {
+        bands.push({ state, start, end });
+      }
+    }
+    // Include an empty array so clients clear a previously optimistic local
+    // interval when SQLite proves that the recovered range is actually empty.
+    bandsByPilot[pilotId] = bands;
+  }
+  return {
+    eventId,
+    replaceFrom: safeFrom,
+    replaceTo: safeTo,
+    bandsByPilot,
+    generatedAt: Date.now(),
+  };
 }
 
 function eventTimelineHasTailGap(event) {
@@ -957,6 +1090,57 @@ function maybeBuildServerLiveState(event, now = Date.now(), force = false) {
   return buildServerLiveState(event, now);
 }
 
+function resolveBackfillEvent(requestedEventId, capturedAt, serverReceivedAt) {
+  const requestedId = String(requestedEventId || "");
+  const exact = requestedId ? eventByIdQuery.get(requestedId) : null;
+  const sampleTime = Number(capturedAt) || 0;
+  if (exact) {
+    const startedAt = Number(exact.started_at) || 0;
+    const endedAt = Number(exact.ended_at) || 0;
+    const coversCaptureTime = startedAt > 0
+      && sampleTime >= startedAt
+      && (endedAt > 0 ? sampleTime <= endedAt : Boolean(exact.active) && sampleTime <= serverReceivedAt);
+    if (!coversCaptureTime) {
+      return {
+        eventRow: null,
+        requestedEventMissing: false,
+        resolvedBy: "",
+        candidateCount: 0,
+        rejectReason: "event_time_mismatch",
+      };
+    }
+    return {
+      eventRow: exact,
+      requestedEventMissing: false,
+      resolvedBy: "event_id",
+      candidateCount: 1,
+      rejectReason: "",
+    };
+  }
+
+  const candidates = sampleTime > 0 && sampleTime <= serverReceivedAt
+    ? eventsCoveringTimeQuery.all(sampleTime, sampleTime).filter((row) => (
+      Number(row.ended_at) > 0 || (Boolean(row.active) && sampleTime <= serverReceivedAt)
+    ))
+    : [];
+  if (candidates.length === 1) {
+    return {
+      eventRow: candidates[0],
+      requestedEventMissing: Boolean(requestedId),
+      resolvedBy: "capture_time",
+      candidateCount: 1,
+      rejectReason: "",
+    };
+  }
+  return {
+    eventRow: null,
+    requestedEventMissing: Boolean(requestedId),
+    resolvedBy: "",
+    candidateCount: candidates.length,
+    rejectReason: candidates.length > 1 ? "ambiguous_capture_time" : "event_not_found",
+  };
+}
+
 function processServerSerialPacket(packet, {
   receivedAt = Date.now(),
   serverReceivedAt = Date.now(),
@@ -979,13 +1163,32 @@ function processServerSerialPacket(packet, {
       outOfWindowSampleCount: 0,
     };
 
-    updateReceiversFromSamples(rawSamples, serverReceivedAt);
+    if (!backfill) updateReceiversFromSamples(rawSamples, serverReceivedAt);
     // Match the stable implementation for current live data: always use the
-    // active event. Only historical recovery is allowed to target its recorded
-    // event id.
-    const eventRow = backfill && eventId ? eventByIdQuery.get(eventId) : activeEventQuery.get();
+    // active event. Historical recovery first uses its recorded event id, then
+    // falls back only when its capture time belongs to exactly one server event.
+    const activeEventId = activeEventQuery.get()?.id || "";
+    const resolution = backfill
+      ? resolveBackfillEvent(eventId, receivedAt, serverReceivedAt)
+      : {
+        eventRow: activeEventQuery.get(),
+        requestedEventMissing: false,
+        resolvedBy: "active_event",
+        candidateCount: 1,
+        rejectReason: "",
+      };
+    const eventRow = resolution.eventRow;
     if (!eventRow) return {
-      accepted: true,
+      accepted: false,
+      ackStatus: backfill ? "orphaned" : "retryable",
+      retryable: !backfill,
+      rejectReason: resolution.rejectReason || (backfill ? "event_not_found" : "no_active_event"),
+      requestedEventId: eventId,
+      activeEventId,
+      resolvedEventId: "",
+      resolvedBy: "",
+      candidateCount: resolution.candidateCount || 0,
+      requestedEventMissing: Boolean(resolution.requestedEventMissing),
       state: maybeBuildServerLiveState(null, serverReceivedAt),
       event: null,
       rawSampleCount: rawSamples.length,
@@ -993,7 +1196,7 @@ function processServerSerialPacket(packet, {
       unmappedSampleCount: 0,
       outOfWindowSampleCount: 0,
       noActiveEvent: !backfill,
-      missingTargetEvent: Boolean(backfill && eventId),
+      missingTargetEvent: Boolean(backfill),
       unassignedReceiverIds: [],
       missingPilotIds: [],
     };
@@ -1006,7 +1209,19 @@ function processServerSerialPacket(packet, {
       if (!claim.changes) {
         db.exec("ROLLBACK");
         transactionStarted = false;
-        return { accepted: false, duplicate: true, state: null, event };
+        return {
+          accepted: false,
+          duplicate: true,
+          ackStatus: "duplicate",
+          state: null,
+          event,
+          requestedEventId: eventId,
+          activeEventId,
+          resolvedEventId: event.id,
+          resolvedBy: resolution.resolvedBy,
+          candidateCount: resolution.candidateCount,
+          requestedEventMissing: Boolean(resolution.requestedEventMissing),
+        };
       }
       claimedEventId = event.id;
     }
@@ -1077,6 +1292,13 @@ function processServerSerialPacket(packet, {
       outOfWindowSampleCount,
       noActiveEvent: false,
       missingTargetEvent: false,
+      ackStatus: persistedSampleCount > 0 ? "persisted" : "processed",
+      requestedEventId: eventId,
+      activeEventId,
+      resolvedEventId: event.id,
+      resolvedBy: resolution.resolvedBy,
+      candidateCount: resolution.candidateCount,
+      requestedEventMissing: Boolean(resolution.requestedEventMissing),
       unassignedReceiverIds: [...unassignedReceiverIds].filter(Boolean).sort((left, right) => left - right),
       missingPilotIds: [...missingPilotIds].filter(Boolean),
     };
@@ -1088,7 +1310,15 @@ function processServerSerialPacket(packet, {
     }
     if (runtimeEventId) runtimeEvents.delete(runtimeEventId);
     serverLiveState.receiverState.error = error.message || "serial packet processing failed";
-    return { accepted: false, error, state: maybeBuildServerLiveState(null, Date.now(), true), event: null };
+    return {
+      accepted: false,
+      ackStatus: "retryable",
+      retryable: true,
+      rejectReason: "processing_failed",
+      error,
+      state: maybeBuildServerLiveState(null, Date.now(), true),
+      event: null,
+    };
   }
 }
 
@@ -1121,26 +1351,54 @@ function processQueuedSerialPackets({ force = false } = {}) {
     }
     if (result.state && !queued.backfill) broadcastLiveState(queued.roomId, result.state);
     if (queued.client && queued.packetId) {
+      const ackStatus = result.ackStatus || (result.duplicate ? "duplicate" : result.accepted ? "processed" : "retryable");
       sendLiveSocketJson(queued.client, {
         type: "live_packet_ack",
         packetId: queued.packetId,
         clientSequence: queued.clientSequence,
-        accepted: Boolean(result.accepted || result.duplicate),
+        status: ackStatus,
+        accepted: ["persisted", "processed", "duplicate"].includes(ackStatus),
+        persisted: ackStatus === "persisted",
         duplicate: Boolean(result.duplicate),
+        retryable: ackStatus === "retryable",
+        rejected: ackStatus === "orphaned",
+        orphaned: ackStatus === "orphaned",
+        reason: result.rejectReason || "",
+        requestedEventId: queued.eventId || "",
+        activeEventId: result.activeEventId || "",
+        resolvedEventId: result.resolvedEventId || result.event?.id || "",
+        resolvedBy: result.resolvedBy || "",
+        capturedAt: queued.receivedAt,
+        candidateCount: Number(result.candidateCount || 0),
+        retryAfterMs: ackStatus === "orphaned" ? 30_000 : ackStatus === "retryable" ? 1000 : 0,
         sampled: true,
         serverTime: Date.now(),
       });
     }
-    if (queued.backfill && result.accepted) {
+    if (queued.backfill) {
       serialIngestStatus.backfillProcessedPackets += 1;
       serialIngestStatus.backfillPersistedSamples += Number(result.persistedSampleCount || 0);
       serialIngestStatus.backfillThrottledSamples += Number(result.throttledSampleCount || 0);
       serialIngestStatus.backfillStaleSamples += Number(result.staleSampleCount || 0);
       serialIngestStatus.backfillUnmappedSamples += Number(result.unmappedSampleCount || 0);
       serialIngestStatus.backfillOutOfWindowSamples += Number(result.outOfWindowSampleCount || 0);
-      if (result.missingTargetEvent) serialIngestStatus.backfillMissingEventPackets += 1;
+      if (result.requestedEventMissing) serialIngestStatus.backfillRequestedEventMissingPackets += 1;
+      if (result.requestedEventMissing && result.ackStatus === "orphaned") {
+        serialIngestStatus.backfillMissingEventPackets += 1;
+      }
+      if (result.resolvedBy === "capture_time") serialIngestStatus.backfillResolvedByCaptureTimePackets += 1;
+      if (result.ackStatus === "orphaned") serialIngestStatus.backfillOrphanedPackets += 1;
       serialIngestStatus.lastBackfillProcessedAt = Date.now();
-      serialIngestStatus.lastBackfillEventId = result.event?.id || queued.eventId || "";
+      serialIngestStatus.lastBackfillEventId = result.event?.id || "";
+      serialIngestStatus.lastBackfillRequestedEventId = queued.eventId || "";
+      serialIngestStatus.lastBackfillActiveEventId = result.activeEventId || "";
+      serialIngestStatus.lastBackfillPacketId = queued.packetId || "";
+      serialIngestStatus.lastBackfillCapturedAt = queued.receivedAt || null;
+      serialIngestStatus.lastBackfillResolvedBy = result.resolvedBy || "";
+      serialIngestStatus.lastBackfillCandidateCount = Number(result.candidateCount || 0);
+      serialIngestStatus.lastBackfillAckStatus = result.ackStatus || "";
+      serialIngestStatus.lastBackfillRejectReason = result.rejectReason || "";
+      onBackfillResult({ queued, result });
     }
     if (result.duplicate) {
       serialIngestStatus.duplicatePackets += 1;
@@ -1239,7 +1497,7 @@ return {
   COACH_LLM_CONFIG_KEY, COACH_SNAPSHOT_INTERVAL_MS, COACH_STALE_AFTER_MS, COACH_WINDOW_MS,
   DEFAULT_COACH_LLM_CONFIG, DEFAULT_LESSON_BUDGET_CONFIG, LESSON_BUDGET_CONFIG_KEY, LESSON_EXTRA_MATERIAL_KEY,
   LESSON_SYSTEM_PROMPT_KEY, LESSON_TEACHING_MANUAL_KEY, PERSONAL_LESSON_OPTIMIZE_LIMIT,
-  activeEventQuery, allPilotsQuery, buildServerLiveState, coachLlmRuntime, eventByIdQuery,
+  activeEventQuery, allPilotsQuery, buildEventTimelinePatch, buildServerLiveState, coachLlmRuntime, eventByIdQuery,
   coachSnapshotStore, ensureTrainingCsvFile, flushPendingTrainingIntervals, flushTrainingCsvQueue, getTrainingCsvStatus,
   ensureEventTimelineCurrent, getEventTimelineStatus,
   maybeBuildServerLiveState, processQueuedSerialPackets, processQueuedTrainingCsvPackets,

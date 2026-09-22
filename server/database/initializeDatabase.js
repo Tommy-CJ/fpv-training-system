@@ -27,6 +27,7 @@ db.exec(`
     time INTEGER NOT NULL,
     ch1 INTEGER, ch2 INTEGER, ch3 INTEGER, ch4 INTEGER,
     ch5 INTEGER, ch6 INTEGER, ch7 INTEGER, ch8 INTEGER,
+    throttle_min INTEGER, throttle_max INTEGER,
     armed INTEGER NOT NULL DEFAULT 0,
     flying INTEGER NOT NULL DEFAULT 0,
     turtle INTEGER NOT NULL DEFAULT 0
@@ -305,6 +306,14 @@ if (!pilotColumns.includes("rate_profile_json")) {
 const trainingEventStatColumns = db.prepare("PRAGMA table_info(training_event_stats)").all().map((column) => column.name);
 if (!trainingEventStatColumns.includes("last_flight_end_at")) {
   db.exec("ALTER TABLE training_event_stats ADD COLUMN last_flight_end_at INTEGER");
+}
+
+const trainingSampleColumns = db.prepare("PRAGMA table_info(training_samples)").all().map((column) => column.name);
+if (!trainingSampleColumns.includes("throttle_min")) {
+  db.exec("ALTER TABLE training_samples ADD COLUMN throttle_min INTEGER");
+}
+if (!trainingSampleColumns.includes("throttle_max")) {
+  db.exec("ALTER TABLE training_samples ADD COLUMN throttle_max INTEGER");
 }
 
 const trackColumns = db.prepare("PRAGMA table_info(tracks)").all().map((column) => column.name);

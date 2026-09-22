@@ -109,17 +109,28 @@ const serverLiveState = {
   },
 };
 const runtimeEvents = new Map();
-// CORE DATA-PLANE INVARIANTS (see docs/LIVE_DATA_PIPELINE.md): current frames
-// own the live display; SQLite owns complete history. Backfill is never
-// broadcast as live data, and a completed recovery must rebuild once and
-// publish a fresh complete baseline to both coach and audience.
+// PROTECTED CORE DATA-PLANE CONTRACT (read docs/LIVE_DATA_PIPELINE.md before
+// editing): current frames own the live display; SQLite owns complete history.
+// Keep the single 30 Hz live stream, its ~5 Hz durable/ACK frames, and the
+// isolated backfill lane. Backfill is never broadcast as current live data.
+// Recovery may publish bounded history patches while draining, then rebuilds
+// once for final authority. New features should consume this contract rather
+// than reorganize it without explicit user approval and full regression proof.
 const SAMPLE_WRITE_INTERVAL_MS = 200;
 const STATS_REFRESH_INTERVAL_MS = 1000;
 const RECEIVER_DB_WRITE_INTERVAL_MS = 1000;
 const SERIAL_PERSISTENCE_INTERVAL_MS = SAMPLE_WRITE_INTERVAL_MS;
-const SERIAL_PERSISTENCE_MAX_PACKETS_PER_TICK = 4;
-const SERIAL_PERSISTENCE_TIME_BUDGET_MS = 12;
-const BACKFILL_FINALIZE_QUIET_MS = 1000;
+const SERIAL_PERSISTENCE_MAX_PACKETS_PER_TICK = 12;
+const SERIAL_PERSISTENCE_TIME_BUDGET_MS = 35;
+// The normal sampler wakes every 200 ms, but recovery must not wait for that
+// clock between every browser upload window. A short yielding drain loop is
+// enabled only while backfill is queued; current packets are still unshifted
+// to the front and therefore retain strict priority.
+const BACKFILL_DRAIN_INTERVAL_MS = 20;
+const BACKFILL_PROGRESS_INTERVAL_MS = 500;
+const IMPLICIT_BACKFILL_DELAY_MS = 400;
+const IMPLICIT_BACKFILL_FINALIZE_QUIET_MS = 1500;
+const BACKFILL_FINALIZE_QUIET_MS = Math.max(1000, Number(process.env.BACKFILL_FINALIZE_QUIET_MS) || 5 * 60_000);
 const MAX_SAMPLE_GAP_MS = 1000;
 const RECENT_SAMPLE_WINDOW_MS = 5000;
 const LIVE_STATE_BROADCAST_INTERVAL_MS = 1000;
@@ -130,11 +141,14 @@ const AUDIENCE_BANDWIDTH_SAFETY_RATIO = Math.min(0.95, Math.max(0.1, Number(proc
 const MAX_AUDIENCE_LIVE_FPS = 30;
 const receiverDbWriteTimes = new Map();
 const pendingSerialPackets = [];
-const lastBackfillSampleAtByEvent = new Map();
 const backfillFinalizeTimers = new Map();
+const backfillProgressTimers = new Map();
+const backfillFinalizeStateByEvent = new Map();
 const pendingTrainingCsvPackets = [];
 const pendingTrainingCsvLines = [];
 let rebuildTrainingTimelineFromSamples = () => false;
+let buildBackfillTimelinePatch = () => null;
+let requestBackfillPersistenceDrain = () => {};
 const serialIngestStatus = {
   receivedPackets: 0,
   processedPackets: 0,
@@ -156,10 +170,32 @@ const serialIngestStatus = {
   backfillUnmappedSamples: 0,
   backfillOutOfWindowSamples: 0,
   backfillMissingEventPackets: 0,
+  backfillRequestedEventMissingPackets: 0,
+  backfillResolvedByCaptureTimePackets: 0,
+  backfillOrphanedPackets: 0,
   backfillDuplicatePackets: 0,
+  backfillProgressPublishCount: 0,
+  backfillFinalizedCount: 0,
+  lastBackfillProgressAt: null,
+  lastBackfillProgressMs: 0,
+  maxBackfillProgressMs: 0,
+  lastBackfillFinalizeMs: 0,
+  maxBackfillFinalizeMs: 0,
+  lastTimelineGapEventId: "",
+  lastTimelineSampleCount: 0,
+  lastTimelineGapCount: 0,
+  lastTimelineMaxGapMs: 0,
   lastBackfillProcessedAt: null,
   lastBackfillFinalizedAt: null,
   lastBackfillEventId: "",
+  lastBackfillRequestedEventId: "",
+  lastBackfillActiveEventId: "",
+  lastBackfillPacketId: "",
+  lastBackfillCapturedAt: null,
+  lastBackfillResolvedBy: "",
+  lastBackfillCandidateCount: 0,
+  lastBackfillAckStatus: "",
+  lastBackfillRejectReason: "",
   failedPackets: 0,
   maxQueuedPackets: 0,
   lastProcessMs: 0,
@@ -546,27 +582,6 @@ function queueSerialPacketForPersistence(roomId, packet, receivedAt, metadata = 
   };
   serialIngestStatus.receivedPackets += 1;
 
-  if (queued.backfill) {
-    const backfillKey = String(queued.eventId || queued.roomId || "default");
-    const lastSampleAt = lastBackfillSampleAtByEvent.get(backfillKey) || 0;
-    if (lastSampleAt && queued.receivedAt >= lastSampleAt && queued.receivedAt - lastSampleAt < 180) {
-      serialIngestStatus.supersededPackets += 1;
-      serialIngestStatus.compactedBackfillPackets += 1;
-      if (queued.client && queued.packetId) {
-        sendLiveSocketJson(queued.client, {
-          type: "live_packet_ack",
-          packetId: queued.packetId,
-          clientSequence: queued.clientSequence,
-          accepted: true,
-          sampled: false,
-          serverTime: Date.now(),
-        });
-      }
-      return;
-    }
-    lastBackfillSampleAtByEvent.set(backfillKey, queued.receivedAt);
-  }
-
   if (!queued.backfill) {
     const existingIndex = pendingSerialPackets.findIndex((candidate) => (
       !candidate.backfill
@@ -602,6 +617,7 @@ function queueSerialPacketForPersistence(roomId, packet, receivedAt, metadata = 
     pendingSerialPackets.unshift(queued);
   } else {
     pendingSerialPackets.push(queued);
+    requestBackfillPersistenceDrain();
   }
   serialIngestStatus.maxQueuedPackets = Math.max(serialIngestStatus.maxQueuedPackets, pendingSerialPackets.length);
 }
@@ -636,27 +652,108 @@ function broadcastTimelineResync(roomId, eventId) {
   for (const subscriber of room.subscribers) sendLiveSocketJson(subscriber, outgoing);
 }
 
+function broadcastTimelinePatch(roomId, patch) {
+  if (!patch?.eventId || !(Number(patch.replaceTo) > Number(patch.replaceFrom))) return false;
+  const room = getLiveRoom(roomId);
+  const outgoing = {
+    type: "live_timeline_patch",
+    ...patch,
+    serverTime: Date.now(),
+    streamId: room.streamId,
+  };
+  // Progressive history is an audience concern. Sending every patch back to
+  // the publishing coach repeatedly re-rendered the page that owns Web Serial,
+  // which could delay serial reads and create the very sample gaps recovery is
+  // supposed to repair. The coach keeps its uninterrupted local live timeline
+  // and receives the one final authoritative baseline after completion.
+  const frame = encodeLiveSocketJson(outgoing);
+  for (const subscriber of room.subscribers) queueSubscriberFrame(subscriber, frame, "state");
+  return true;
+}
+
+function publishBackfillTimelineProgress(roomId, eventId) {
+  const safeEventId = String(eventId || "").slice(0, 160);
+  const timer = backfillProgressTimers.get(safeEventId);
+  if (timer) clearTimeout(timer);
+  backfillProgressTimers.delete(safeEventId);
+  const state = backfillFinalizeStateByEvent.get(safeEventId);
+  if (!state || !(Number(state.dirtyTo) > Number(state.dirtyFrom))) return false;
+
+  const replaceFrom = Math.max(1, Number(state.dirtyFrom) - MAX_SAMPLE_GAP_MS);
+  const replaceTo = Number(state.dirtyTo) + MAX_SAMPLE_GAP_MS;
+  const startedAt = Date.now();
+  try {
+    const patch = buildBackfillTimelinePatch(safeEventId, replaceFrom, replaceTo);
+    if (!patch || !broadcastTimelinePatch(roomId || state.roomId || "default", patch)) return false;
+    const elapsed = Date.now() - startedAt;
+    state.dirtyFrom = null;
+    state.dirtyTo = null;
+    state.lastProgressAt = Date.now();
+    state.progressPublishCount = Number(state.progressPublishCount || 0) + 1;
+    serialIngestStatus.backfillProgressPublishCount += 1;
+    serialIngestStatus.lastBackfillProgressAt = state.lastProgressAt;
+    serialIngestStatus.lastBackfillProgressMs = elapsed;
+    serialIngestStatus.maxBackfillProgressMs = Math.max(serialIngestStatus.maxBackfillProgressMs, elapsed);
+    return true;
+  } catch (error) {
+    serialIngestStatus.lastError = error.message || "historical timeline progress failed";
+    serialIngestStatus.failedPackets += 1;
+    return false;
+  }
+}
+
+function scheduleBackfillTimelineProgress(roomId, eventId) {
+  const safeEventId = String(eventId || "").slice(0, 160);
+  if (!safeEventId || backfillProgressTimers.has(safeEventId)) return;
+  const state = backfillFinalizeStateByEvent.get(safeEventId);
+  const earliestAt = Number(state?.lastProgressAt || 0) + BACKFILL_PROGRESS_INTERVAL_MS;
+  const delay = Math.max(0, earliestAt - Date.now());
+  const timer = setTimeout(() => {
+    publishBackfillTimelineProgress(roomId, safeEventId);
+  }, delay);
+  timer.unref?.();
+  backfillProgressTimers.set(safeEventId, timer);
+}
+
 function finalizeBackfillTimeline(roomId, eventId) {
   const safeEventId = String(eventId || "").slice(0, 160);
   if (!safeEventId) return false;
   const timer = backfillFinalizeTimers.get(safeEventId);
   if (timer) clearTimeout(timer);
   backfillFinalizeTimers.delete(safeEventId);
+  const progressTimer = backfillProgressTimers.get(safeEventId);
+  if (progressTimer) clearTimeout(progressTimer);
+  backfillProgressTimers.delete(safeEventId);
 
   // The quiet timer can fire just before the 200 ms persistence worker. Do
   // not rebuild until every packet for this event has actually left the queue.
-  if (pendingSerialPackets.some((queued) => queued.backfill && queued.eventId === safeEventId)) {
-    scheduleBackfillTimelineFinalize(roomId, safeEventId);
+  if (pendingSerialPackets.some((queued) => queued.backfill && String(queued.eventId || "") === safeEventId)) {
+    scheduleBackfillTimelineFinalize(roomId, safeEventId, 200);
     return false;
   }
 
+  const finalizeState = backfillFinalizeStateByEvent.get(safeEventId);
+  if (!finalizeState || finalizeState.completedPackets < 1) return false;
+
+  const startedAt = Date.now();
   try {
     // Force is intentional: even an in-order recovery generation must publish
     // one complete, coherent SQLite timeline before clients replace their
     // temporary live rendering.
-    rebuildTrainingTimelineFromSamples(safeEventId, Date.now(), { force: true });
+    const rebuilt = rebuildTrainingTimelineFromSamples(safeEventId, Date.now(), { force: true });
+    if (!rebuilt) {
+      serialIngestStatus.lastError = `historical timeline rebuild skipped: event ${safeEventId} not found`;
+      serialIngestStatus.failedPackets += 1;
+      return false;
+    }
     serialIngestStatus.lastBackfillFinalizedAt = Date.now();
     serialIngestStatus.lastBackfillEventId = safeEventId;
+    serialIngestStatus.backfillFinalizedCount += 1;
+    serialIngestStatus.lastBackfillFinalizeMs = Date.now() - startedAt;
+    serialIngestStatus.maxBackfillFinalizeMs = Math.max(
+      serialIngestStatus.maxBackfillFinalizeMs,
+      serialIngestStatus.lastBackfillFinalizeMs,
+    );
   } catch (error) {
     serialIngestStatus.lastError = error.message || "historical timeline rebuild failed";
     serialIngestStatus.failedPackets += 1;
@@ -679,19 +776,66 @@ function finalizeBackfillTimeline(roomId, eventId) {
     serialIngestStatus.failedPackets += 1;
   }
   broadcastTimelineResync(roomId, safeEventId);
+  backfillFinalizeStateByEvent.delete(safeEventId);
   return true;
 }
 
-function scheduleBackfillTimelineFinalize(roomId, eventId) {
+function scheduleBackfillTimelineFinalize(roomId, eventId, delayMs = BACKFILL_FINALIZE_QUIET_MS) {
   const safeEventId = String(eventId || "").slice(0, 160);
   if (!safeEventId) return;
   const existing = backfillFinalizeTimers.get(safeEventId);
   if (existing) clearTimeout(existing);
   const timer = setTimeout(() => {
     finalizeBackfillTimeline(roomId, safeEventId);
-  }, BACKFILL_FINALIZE_QUIET_MS);
+  }, Math.max(0, delayMs));
   timer.unref?.();
   backfillFinalizeTimers.set(safeEventId, timer);
+}
+
+function handleProcessedBackfill({ queued, result }) {
+  const ackStatus = result?.ackStatus || (result?.duplicate ? "duplicate" : result?.accepted ? "processed" : "retryable");
+  const resolvedEventId = String(result?.resolvedEventId || result?.event?.id || "").slice(0, 160);
+  if (!resolvedEventId) return;
+  let current = backfillFinalizeStateByEvent.get(resolvedEventId);
+  // A duplicate-only replay changes nothing in SQLite and must not trigger a
+  // full timeline rebuild. Rebuilding for every delayed duplicate gets more
+  // expensive as an event grows, blocks live persistence, causes ACK timeouts,
+  // and creates a self-amplifying duplicate/rebuild loop. Once a generation
+  // has actually persisted history, later duplicates still extend its quiet
+  // window so that generation is finalized exactly once after it drains.
+  if (!current && ackStatus !== "persisted") return;
+  if (!current) {
+    current = {
+      completedPackets: 0,
+      persistedSamples: 0,
+      duplicatePackets: 0,
+      dirtyFrom: null,
+      dirtyTo: null,
+      lastProgressAt: 0,
+      progressPublishCount: 0,
+    };
+  }
+  current.completedPackets += 1;
+  current.persistedSamples += Number(result?.persistedSampleCount || 0);
+  if (ackStatus === "duplicate") current.duplicatePackets += 1;
+  if (ackStatus === "persisted") {
+    const capturedAt = Number(queued.receivedAt) || Number(result?.latestSampleTime) || Date.now();
+    const latestSampleTime = Number(result?.latestSampleTime) || capturedAt;
+    current.dirtyFrom = current.dirtyFrom === null ? capturedAt : Math.min(current.dirtyFrom, capturedAt);
+    current.dirtyTo = current.dirtyTo === null ? latestSampleTime : Math.max(current.dirtyTo, latestSampleTime);
+  }
+  current.lastProcessedAt = Date.now();
+  current.roomId = queued.roomId || "default";
+  backfillFinalizeStateByEvent.set(resolvedEventId, current);
+  if (ackStatus === "persisted") scheduleBackfillTimelineProgress(current.roomId, resolvedEventId);
+  // The explicit live_backfill_complete message normally finalizes immediately.
+  // This long quiet timer is only a safety net for a browser that disappears
+  // after uploading data but before sending the completion control message.
+  scheduleBackfillTimelineFinalize(
+    current.roomId,
+    resolvedEventId,
+    queued.implicitBackfill ? IMPLICIT_BACKFILL_FINALIZE_QUIET_MS : BACKFILL_FINALIZE_QUIET_MS,
+  );
 }
 
 function handleLiveSocketMessage(client, message) {
@@ -742,7 +886,26 @@ function handleLiveSocketMessage(client, message) {
 
   const receivedAt = Date.now();
   const publisherTime = Number(message.clientTime);
-  const backfill = Boolean(message.backfill);
+  const packetId = String(message.packetId || "").slice(0, 160);
+  const durable = Boolean(message.liveOnly && message.durable && packetId);
+  const explicitBackfill = Boolean(message.backfill);
+  let transportDelayMs = 0;
+  if (Number.isFinite(publisherTime) && publisherTime > 0) {
+    const observedClockOffsetMs = receivedAt - publisherTime;
+    const previousClockOffsetMs = Number(client.publisherClockOffsetMs);
+    if (Number.isFinite(previousClockOffsetMs)) {
+      transportDelayMs = Math.max(0, observedClockOffsetMs - previousClockOffsetMs);
+      // The minimum observed offset on this connection approximates its clock
+      // offset plus best-case network latency. A brief outage raises only the
+      // current observation, so buffered durable frames can be distinguished
+      // without assuming that browser and server wall clocks are identical.
+      client.publisherClockOffsetMs = Math.min(previousClockOffsetMs, observedClockOffsetMs);
+    } else {
+      client.publisherClockOffsetMs = observedClockOffsetMs;
+    }
+  }
+  const implicitBackfill = durable && transportDelayMs >= IMPLICIT_BACKFILL_DELAY_MS;
+  const backfill = explicitBackfill || implicitBackfill;
   // Stable live semantics use server receipt time as the canonical clock.
   // Only explicit recovery packets retain their original capture time.
   const sampleTime = backfill
@@ -753,7 +916,6 @@ function handleLiveSocketMessage(client, message) {
     // per-pilot 5 Hz cursor and make every following live sample look stale.
     ? Math.min(publisherTime, receivedAt)
     : receivedAt;
-  const packetId = String(message.packetId || "").slice(0, 160);
   const source = String(message.source || "").slice(0, 64);
   const eventId = String(message.eventId || "").slice(0, 160);
   // IndexedDB must commit a durable frame before it is sent, so a following
@@ -773,13 +935,14 @@ function handleLiveSocketMessage(client, message) {
     // persistOnly message is needed. Plain liveOnly frames still feed the
     // server-owned sampler as a compatibility/failure fallback, so a broken
     // browser outbox can never make authoritative history disappear again.
-    const durable = Boolean(message.durable && packetId);
     queueSerialPacketForPersistence(roomId, batch, sampleTime, durable ? {
       serverReceivedAt: receivedAt,
       packetId,
       eventId,
       clientSequence: Number(message.clientSequence) || null,
       client,
+      backfill,
+      implicitBackfill,
     } : {
       serverReceivedAt: receivedAt,
       fallbackPersistence: true,
@@ -794,11 +957,6 @@ function handleLiveSocketMessage(client, message) {
     client,
     backfill,
   });
-  // Do not rely exclusively on the browser's final control message. Mobile
-  // browsers can suspend or replace a socket immediately after reconnecting.
-  // Continuous recovery traffic keeps resetting this timer; one quiet second
-  // after the last batch, the server rebuilds and notifies both clients.
-  if (backfill && eventId) scheduleBackfillTimelineFinalize(roomId, eventId);
 }
 
 server.on("upgrade", (req, socket) => {
@@ -838,6 +996,7 @@ server.on("upgrade", (req, socket) => {
     pendingLiveFrame: null,
     pendingStateFrame: null,
     lastLiveSentAt: 0,
+    publisherClockOffsetMs: null,
     flushStateFirst: false,
   };
 
@@ -1600,8 +1759,8 @@ app.post("/api/receivers/:id/bind", (req, res) => {
 
 const insertSample = db.prepare(`
   INSERT INTO training_samples
-    (event_id, pilot_id, receiver_id, time, ch1, ch2, ch3, ch4, ch5, ch6, ch7, ch8, armed, flying, turtle)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (event_id, pilot_id, receiver_id, time, ch1, ch2, ch3, ch4, ch5, ch6, ch7, ch8, throttle_min, throttle_max, armed, flying, turtle)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 const lastSample = db.prepare("SELECT time FROM training_samples WHERE event_id = ? AND pilot_id = ? ORDER BY time DESC LIMIT 1");
 const lastSampleDetail = db.prepare(`
@@ -1632,6 +1791,8 @@ app.post("/api/training-events/:id/samples", (req, res) => {
         sampleChannelValue(sample, "ch6"),
         sampleChannelValue(sample, "ch7"),
         sampleChannelValue(sample, "ch8"),
+        Number.isFinite(Number(sample.throttleMin)) ? Number(sample.throttleMin) : sampleChannelValue(sample, "ch3"),
+        Number.isFinite(Number(sample.throttleMax)) ? Number(sample.throttleMax) : sampleChannelValue(sample, "ch3"),
         sample.armed ? 1 : 0,
         sample.flying ? 1 : 0,
         sample.turtle ? 1 : 0,
@@ -1680,19 +1841,34 @@ const trainingRuntime = createTrainingRuntime({
   runtimeEvents, sampleChannelValue, sampleWriteIntervalMs: SAMPLE_WRITE_INTERVAL_MS,
   serialIngestStatus, serialPersistenceMaxPacketsPerTick: SERIAL_PERSISTENCE_MAX_PACKETS_PER_TICK,
   serialPersistenceTimeBudgetMs: SERIAL_PERSISTENCE_TIME_BUDGET_MS,
-  sendLiveSocketJson, serverLiveState, statsRefreshIntervalMs: STATS_REFRESH_INTERVAL_MS, trainingCsvFile, trainingCsvStatus,
+  sendLiveSocketJson, serverLiveState, statsRefreshIntervalMs: STATS_REFRESH_INTERVAL_MS,
+  onBackfillResult: handleProcessedBackfill, trainingCsvFile, trainingCsvStatus,
 });
 const {
   COACH_LLM_CONFIG_KEY, COACH_SNAPSHOT_INTERVAL_MS, COACH_STALE_AFTER_MS, COACH_WINDOW_MS,
   DEFAULT_COACH_LLM_CONFIG, DEFAULT_LESSON_BUDGET_CONFIG, LESSON_BUDGET_CONFIG_KEY, LESSON_EXTRA_MATERIAL_KEY,
   LESSON_SYSTEM_PROMPT_KEY, LESSON_TEACHING_MANUAL_KEY, PERSONAL_LESSON_OPTIMIZE_LIMIT,
-  activeEventQuery, allPilotsQuery, buildServerLiveState, coachLlmRuntime, eventByIdQuery,
+  activeEventQuery, allPilotsQuery, buildEventTimelinePatch, buildServerLiveState, coachLlmRuntime, eventByIdQuery,
   coachSnapshotStore, ensureTrainingCsvFile, flushTrainingCsvQueue, getTrainingCsvStatus,
   ensureEventTimelineCurrent, flushPendingTrainingIntervals, getEventTimelineStatus,
   maybeBuildServerLiveState, processQueuedSerialPackets,
   rebuildEventTimelineFromSamples, refreshReceiverState, refreshTrainingCsvFileSize, upsertStat,
 } = trainingRuntime;
 rebuildTrainingTimelineFromSamples = rebuildEventTimelineFromSamples;
+buildBackfillTimelinePatch = buildEventTimelinePatch;
+let backfillDrainTimer = null;
+function scheduleBackfillPersistenceDrain(delayMs = 0) {
+  if (backfillDrainTimer || !pendingSerialPackets.some((queued) => queued.backfill)) return;
+  backfillDrainTimer = setTimeout(() => {
+    backfillDrainTimer = null;
+    processQueuedSerialPackets();
+    if (pendingSerialPackets.some((queued) => queued.backfill)) {
+      scheduleBackfillPersistenceDrain(BACKFILL_DRAIN_INTERVAL_MS);
+    }
+  }, Math.max(0, delayMs));
+  backfillDrainTimer.unref?.();
+}
+requestBackfillPersistenceDrain = () => scheduleBackfillPersistenceDrain(0);
 const teachingBridge = {};
 const coachFeature = registerCoachFeature({
   activeEventQuery, allPilotsQuery, app, coachLlmConfigKey: COACH_LLM_CONFIG_KEY, coachLlmRuntime,
@@ -1759,8 +1935,13 @@ server.on("close", () => {
   clearInterval(coachSnapshotTimer);
   clearInterval(serialPersistenceTimer);
   clearInterval(trainingCsvFlushTimer);
+  if (backfillDrainTimer) clearTimeout(backfillDrainTimer);
+  backfillDrainTimer = null;
   for (const timer of backfillFinalizeTimers.values()) clearTimeout(timer);
   backfillFinalizeTimers.clear();
+  for (const timer of backfillProgressTimers.values()) clearTimeout(timer);
+  backfillProgressTimers.clear();
+  backfillFinalizeStateByEvent.clear();
   while (pendingSerialPackets.length) processQueuedSerialPackets({ force: true });
   flushPendingTrainingIntervals(Date.now(), true);
   flushTrainingCsvQueue();

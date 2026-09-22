@@ -43,4 +43,35 @@ state = consumeSerialJsonStream("", '{"type":"rx_batch","items":[}]{"rx":4,"ch":
 assert.equal(state.failures.length, 1, "a balanced malformed frame must still be reported");
 assert.equal(state.frames.at(-1)?.packet?.rx, 4, "a malformed frame must not prevent the following valid frame");
 
-console.log(JSON.stringify({ ok: true, reassembledReceivers: firstPacket.items.length, concatenatedFrames: 2 }));
+const truncatedPacket = encodedFirst.slice(0, Math.floor(encodedFirst.length / 2));
+state = consumeSerialJsonStream("", `${truncatedPacket}${encodedSecond}`);
+assert.equal(state.failures.length, 1, "a truncated packet must be reported at the next packet header");
+assert.deepEqual(
+  state.frames.map(({ packet }) => packet),
+  [secondPacket],
+  "one truncated USB frame must not poison the valid packets that follow it",
+);
+assert.equal(state.buffer, "", "packet-header recovery must leave no poisoned tail");
+
+const splitRecoveryAt = Math.floor(encodedSecond.length / 3);
+state = consumeSerialJsonStream("", truncatedPacket);
+state = consumeSerialJsonStream(state.buffer, encodedSecond.slice(0, splitRecoveryAt));
+assert.equal(state.failures.length, 1, "a split replacement header must still abandon the truncated frame");
+assert.equal(state.frames.length, 0, "a split replacement packet must wait for its tail");
+state = consumeSerialJsonStream(state.buffer, encodedSecond.slice(splitRecoveryAt));
+assert.deepEqual(state.frames.map(({ packet }) => packet), [secondPacket], "split replacement packet was not recovered");
+
+const truncatedInsideString = `${encodedFirst.slice(0, encodedFirst.indexOf('"items"') + 2)}${encodedSecond}`;
+state = consumeSerialJsonStream("", truncatedInsideString);
+assert.equal(state.failures.length, 1, "a packet truncated inside a JSON string must resynchronize");
+assert.deepEqual(state.frames.map(({ packet }) => packet), [secondPacket], "string-state truncation poisoned the next packet");
+
+const packetWithHeaderText = {
+  ...secondPacket,
+  note: 'diagnostic {"type":"rx_batch","items":[]} text',
+};
+state = consumeSerialJsonStream("", JSON.stringify(packetWithHeaderText));
+assert.equal(state.failures.length, 0, "a packet-shaped string value must not trigger resynchronization");
+assert.deepEqual(state.frames.map(({ packet }) => packet), [packetWithHeaderText], "string content corrupted a valid packet");
+
+console.log(JSON.stringify({ ok: true, reassembledReceivers: firstPacket.items.length, concatenatedFrames: 2, truncatedRecovery: true }));

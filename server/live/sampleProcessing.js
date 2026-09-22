@@ -36,7 +36,14 @@ function getPilotState(pilot, sample, recentSamples) {
   const turtleRanges = getRanges(config, "turtle");
   const armed = armRanges.some((range) => isValueInRanges(channels[range.channelKey], [range]));
   const turtleSwitch = turtleRanges.some((range) => isValueInRanges(channels[range.channelKey], [range]));
-  const throttleValues = recentSamples.map((item) => item.channels?.ch3).filter((value) => Number.isFinite(value));
+  // Frozen state rule: server-owned, armed now, and >80 throttle spread over
+  // the preceding five seconds. Do not replace this with absolute throttle,
+  // stick offset, client-provided state, or hysteresis/hold-time shortcuts.
+  const throttleValues = recentSamples.flatMap((item) => [
+    item.channels?.ch3,
+    item.throttleMin,
+    item.throttleMax,
+  ]).filter((value) => Number.isFinite(value));
   const throttleSpread = throttleValues.length ? Math.max(...throttleValues) - Math.min(...throttleValues) : 0;
   const turtle = armed && turtleSwitch;
   const flying = armed && throttleSpread > 80;
@@ -46,6 +53,21 @@ function getPilotState(pilot, sample, recentSamples) {
 function parseSerialPacket(packet, receivedAt = Date.now()) {
   const frameTime = Number(packet?.t) || null;
   const items = packet?.type === "rx_batch" && Array.isArray(packet.items) ? packet.items : [packet];
+  const throttleWindowByReceiver = new Map();
+  const historyItems = packet?.type === "rx_batch" && Array.isArray(packet.history)
+    ? packet.history.slice(-512)
+    : [];
+  for (const item of historyItems) {
+    const receiverId = Number(item?.rx);
+    const rawThrottle = Number(Array.isArray(item?.ch) ? item.ch[2] : NaN);
+    if (!Number.isFinite(receiverId) || receiverId < 1 || !isValidCrsfChannel(rawThrottle)) continue;
+    const throttle = crsfToPwm(rawThrottle);
+    const existing = throttleWindowByReceiver.get(receiverId);
+    throttleWindowByReceiver.set(receiverId, {
+      min: existing ? Math.min(existing.min, throttle) : throttle,
+      max: existing ? Math.max(existing.max, throttle) : throttle,
+    });
+  }
   const samples = [];
 
   for (const item of items) {
@@ -61,6 +83,7 @@ function parseSerialPacket(packet, receivedAt = Date.now()) {
 
     const linkQuality = Number(item.lq ?? item.linkQuality ?? 0);
     const rssi = Number(item.rssi ?? -127);
+    const throttleWindow = throttleWindowByReceiver.get(receiverId);
     samples.push({
       time: receivedAt,
       sourceTime: Number(item.t) || frameTime,
@@ -78,6 +101,8 @@ function parseSerialPacket(packet, receivedAt = Date.now()) {
         ch7: pwmChannels[6],
         ch8: pwmChannels[7],
       },
+      throttleMin: Math.min(pwmChannels[2], throttleWindow?.min ?? pwmChannels[2]),
+      throttleMax: Math.max(pwmChannels[2], throttleWindow?.max ?? pwmChannels[2]),
     });
   }
 
