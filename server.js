@@ -124,12 +124,10 @@ const SERIAL_PERSISTENCE_MAX_PACKETS_PER_TICK = 12;
 const SERIAL_PERSISTENCE_TIME_BUDGET_MS = 35;
 // The normal sampler wakes every 200 ms, but recovery must not wait for that
 // clock between every browser upload window. A short yielding drain loop is
-// enabled only while backfill is queued; current packets are still unshifted
-// to the front and therefore retain strict priority.
+// enabled only while backfill is queued; current packets stay ahead of the
+// recovery lane in FIFO order and therefore retain strict priority.
 const BACKFILL_DRAIN_INTERVAL_MS = 20;
 const BACKFILL_PROGRESS_INTERVAL_MS = 500;
-const IMPLICIT_BACKFILL_DELAY_MS = 400;
-const IMPLICIT_BACKFILL_FINALIZE_QUIET_MS = 1500;
 const BACKFILL_FINALIZE_QUIET_MS = Math.max(1000, Number(process.env.BACKFILL_FINALIZE_QUIET_MS) || 5 * 60_000);
 const MAX_SAMPLE_GAP_MS = 1000;
 const RECENT_SAMPLE_WINDOW_MS = 5000;
@@ -583,38 +581,35 @@ function queueSerialPacketForPersistence(roomId, packet, receivedAt, metadata = 
   serialIngestStatus.receivedPackets += 1;
 
   if (!queued.backfill) {
-    const existingIndex = pendingSerialPackets.findIndex((candidate) => (
+    const sameRoomCurrent = (candidate) => (
       !candidate.backfill
       && candidate.roomId === queued.roomId
-    ));
-    if (existingIndex >= 0) {
-      const existing = pendingSerialPackets[existingIndex];
-      // The server-owned live fallback is intentionally lower priority than a
-      // durable client outbox packet. Keep the explicit packet when both land
-      // in the same 200 ms sampling window so it is acknowledged only after
-      // processing, while still allowing live frames to persist when the
-      // browser's secondary persistence path is unavailable.
-      if (queued.fallbackPersistence && existing.packetId) {
-        serialIngestStatus.supersededPackets += 1;
-        serialIngestStatus.compactedCurrentPackets += 1;
-        return;
-      }
-      const superseded = pendingSerialPackets.splice(existingIndex, 1)[0];
+    );
+    // Only the unacknowledged 30 Hz compatibility fallback is disposable.
+    // A durable frame is already in the browser's IndexedDB; compacting it
+    // and replying accepted:true made the browser delete a packet that SQLite
+    // never processed, producing irrecoverable white holes in the strip.
+    if (queued.fallbackPersistence && pendingSerialPackets.some((candidate) => (
+      sameRoomCurrent(candidate) && candidate.packetId
+    ))) {
       serialIngestStatus.supersededPackets += 1;
       serialIngestStatus.compactedCurrentPackets += 1;
-      if (superseded.client && superseded.packetId) {
-        sendLiveSocketJson(superseded.client, {
-          type: "live_packet_ack",
-          packetId: superseded.packetId,
-          clientSequence: superseded.clientSequence,
-          accepted: true,
-          sampled: false,
-          serverTime: Date.now(),
-        });
-      }
+      return;
     }
-    // Current live persistence always wins over historical recovery work.
-    pendingSerialPackets.unshift(queued);
+    const existingFallbackIndex = pendingSerialPackets.findIndex((candidate) => (
+      sameRoomCurrent(candidate) && candidate.fallbackPersistence
+    ));
+    if (existingFallbackIndex >= 0) {
+      pendingSerialPackets.splice(existingFallbackIndex, 1);
+      serialIngestStatus.supersededPackets += 1;
+      serialIngestStatus.compactedCurrentPackets += 1;
+    }
+    // Keep every durable frame in arrival order, ahead of the historical
+    // lane. Reversing current frames would make an older durable sample look
+    // stale after the newer one was written, despite both receiving ACKs.
+    const firstBackfillIndex = pendingSerialPackets.findIndex((candidate) => candidate.backfill);
+    if (firstBackfillIndex >= 0) pendingSerialPackets.splice(firstBackfillIndex, 0, queued);
+    else pendingSerialPackets.push(queued);
   } else {
     pendingSerialPackets.push(queued);
     requestBackfillPersistenceDrain();
@@ -831,11 +826,7 @@ function handleProcessedBackfill({ queued, result }) {
   // The explicit live_backfill_complete message normally finalizes immediately.
   // This long quiet timer is only a safety net for a browser that disappears
   // after uploading data but before sending the completion control message.
-  scheduleBackfillTimelineFinalize(
-    current.roomId,
-    resolvedEventId,
-    queued.implicitBackfill ? IMPLICIT_BACKFILL_FINALIZE_QUIET_MS : BACKFILL_FINALIZE_QUIET_MS,
-  );
+  scheduleBackfillTimelineFinalize(current.roomId, resolvedEventId, BACKFILL_FINALIZE_QUIET_MS);
 }
 
 function handleLiveSocketMessage(client, message) {
@@ -888,24 +879,14 @@ function handleLiveSocketMessage(client, message) {
   const publisherTime = Number(message.clientTime);
   const packetId = String(message.packetId || "").slice(0, 160);
   const durable = Boolean(message.liveOnly && message.durable && packetId);
-  const explicitBackfill = Boolean(message.backfill);
-  let transportDelayMs = 0;
-  if (Number.isFinite(publisherTime) && publisherTime > 0) {
-    const observedClockOffsetMs = receivedAt - publisherTime;
-    const previousClockOffsetMs = Number(client.publisherClockOffsetMs);
-    if (Number.isFinite(previousClockOffsetMs)) {
-      transportDelayMs = Math.max(0, observedClockOffsetMs - previousClockOffsetMs);
-      // The minimum observed offset on this connection approximates its clock
-      // offset plus best-case network latency. A brief outage raises only the
-      // current observation, so buffered durable frames can be distinguished
-      // without assuming that browser and server wall clocks are identical.
-      client.publisherClockOffsetMs = Math.min(previousClockOffsetMs, observedClockOffsetMs);
-    } else {
-      client.publisherClockOffsetMs = observedClockOffsetMs;
-    }
-  }
-  const implicitBackfill = durable && transportDelayMs >= IMPLICIT_BACKFILL_DELAY_MS;
-  const backfill = explicitBackfill || implicitBackfill;
+  // PROTECTED RECOVERY-LANE CONTRACT: only an IndexedDB replay explicitly
+  // marked by the publisher may enter backfill. Delay, clock skew, a hidden
+  // browser tab, slow IndexedDB/CSV work, or server event-loop pressure must
+  // never turn a current durable frame into historical recovery. Inferring
+  // recovery from latency creates a feedback loop: a false recovery triggers
+  // a rebuild, the rebuild adds latency, and more current frames are then
+  // falsely classified as recovery.
+  const backfill = message.backfill === true;
   // Stable live semantics use server receipt time as the canonical clock.
   // Only explicit recovery packets retain their original capture time.
   const sampleTime = backfill
@@ -942,7 +923,6 @@ function handleLiveSocketMessage(client, message) {
       clientSequence: Number(message.clientSequence) || null,
       client,
       backfill,
-      implicitBackfill,
     } : {
       serverReceivedAt: receivedAt,
       fallbackPersistence: true,
@@ -996,7 +976,6 @@ server.on("upgrade", (req, socket) => {
     pendingLiveFrame: null,
     pendingStateFrame: null,
     lastLiveSentAt: 0,
-    publisherClockOffsetMs: null,
     flushStateFirst: false,
   };
 

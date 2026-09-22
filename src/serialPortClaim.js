@@ -1,7 +1,14 @@
 const TRAINING_SERIAL_CLAIM_KEY = "fpv-training-active-serial-port-v1";
 const BETAFLIGHT_SERIAL_CLAIM_KEY = "fpv-betaflight-active-serial-port-v1";
 const PREFERRED_TRAINING_SERIAL_PORT_KEY = "fpv-training-preferred-serial-port-v1";
-const TRAINING_SERIAL_CLAIM_TTL_MS = 5000;
+// Hidden Chromium tabs may coalesce ordinary Window timers to roughly one
+// callback per minute. A five-second claim therefore expired even though the
+// Dedicated Worker still owned and consumed the serial port, allowing another
+// page to mistake a healthy connection for an abandoned one. Keep the claim
+// comfortably beyond the background throttle interval while still allowing a
+// crashed tab to become recoverable without a browser restart.
+const TRAINING_SERIAL_CLAIM_TTL_MS = 90_000;
+const TRAINING_SERIAL_CLAIM_HEARTBEAT_MS = 15_000;
 
 function safePortInfo(port) {
   const info = port?.getInfo?.() || {};
@@ -144,6 +151,7 @@ export async function listUnclaimedAuthorizedSerialPorts() {
 export {
   BETAFLIGHT_SERIAL_CLAIM_KEY,
   PREFERRED_TRAINING_SERIAL_PORT_KEY,
+  TRAINING_SERIAL_CLAIM_HEARTBEAT_MS,
   TRAINING_SERIAL_CLAIM_KEY,
   TRAINING_SERIAL_CLAIM_TTL_MS,
 };

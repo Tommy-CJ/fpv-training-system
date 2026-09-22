@@ -19,15 +19,19 @@ import {
   outboxAckRetryDelay,
   shouldDeleteOutboxPacketForAck,
   shouldDiscardOrphanedOutboxPacket,
+  shouldKeepScheduledOutboxFlush,
   shouldSendCurrentPersistence,
 } from "./livePersistence.js";
+import { createSerialCaptureClock } from "./serialCaptureClock.js";
 import { consumeSerialJsonStream } from "./serialJsonStream.js";
 import {
   claimTrainingSerialPort,
+  describeSerialPort,
   findPreferredTrainingSerialPort,
   isBetaflightSerialPortClaimed,
   releaseTrainingSerialPortClaim,
   rememberTrainingSerialPort,
+  TRAINING_SERIAL_CLAIM_HEARTBEAT_MS,
 } from "./serialPortClaim.js";
 
 function makePilot(index) {
@@ -240,6 +244,12 @@ const OUTBOX_REPLAY_BATCH_SIZE = 16;
 const OUTBOX_REPLAY_INTERVAL_MS = 25;
 const OUTBOX_ACK_TIMEOUT_MS = 3000;
 const AUDIENCE_LIVE_STALE_MS = 1000;
+
+function serialUiUpdatesAllowed(sampleTime = Date.now()) {
+  if (typeof document !== "undefined" && document.visibilityState === "hidden") return false;
+  const timestamp = Number(sampleTime);
+  return !Number.isFinite(timestamp) || Date.now() - timestamp < OUTBOX_ACK_TIMEOUT_MS;
+}
 
 function loadLiveSessionId() {
   try {
@@ -467,6 +477,12 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
   const [, setServerConnected] = useState(false);
   const portRef = useRef(null);
   const readerRef = useRef(null);
+  const serialTransportRef = useRef("");
+  const serialWorkerRef = useRef(null);
+  const serialWorkerRequestIdRef = useRef(0);
+  const serialWorkerRequestsRef = useRef(new Map());
+  const serialWorkerMessageHandlerRef = useRef(null);
+  const releaseSerialResourcesRef = useRef(null);
   const ttsAudioContextRef = useRef(null);
   const lastTtsQueuedAtRef = useRef(0);
   const aiTtsStartedAtRef = useRef(Date.now());
@@ -581,7 +597,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       } else {
         stopTrainingSerialClaim();
       }
-    }, 1000);
+    }, TRAINING_SERIAL_CLAIM_HEARTBEAT_MS);
   }
 
   useEffect(() => {
@@ -971,7 +987,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
     });
   }, []);
 
-  function recordSerialInputFrame(receivedAt = Date.now()) {
+  function recordSerialInputFrame(receivedAt = Date.now(), updateUi = true) {
     const stats = serialInputFpsRef.current;
     if (!stats.startedAt) {
       serialInputFpsRef.current = { count: 1, startedAt: receivedAt };
@@ -980,7 +996,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
     stats.count += 1;
     const elapsed = receivedAt - stats.startedAt;
     if (elapsed >= 1000) {
-      setSerialInputFps((stats.count * 1000) / elapsed);
+      if (updateUi) setSerialInputFps((stats.count * 1000) / elapsed);
       serialInputFpsRef.current = { count: 0, startedAt: receivedAt };
     }
   }
@@ -1006,6 +1022,11 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
 
   useEffect(() => {
     const timer = window.setInterval(() => {
+      // Receiver pruning and FPS are display maintenance only. Keeping this
+      // hot timer inert while hidden reduces the chance that the browser marks
+      // the capture tab as background-CPU-heavy; freshness filtering still
+      // happens when each durable snapshot is built.
+      if (document.visibilityState === "hidden") return;
       const lastDataAt = Number(serialStateRef.current?.lastDataAt || 0);
       pruneStaleSerialSamples();
       if (!lastDataAt || Date.now() - lastDataAt > 1500) {
@@ -1084,32 +1105,96 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
     if (error) pushStatus(error);
   }
 
-  async function releaseSerialResources({ clear = true, error = "", preserveSamples = false } = {}) {
+  function disposeSerialWorker() {
+    const worker = serialWorkerRef.current;
+    serialWorkerRef.current = null;
+    for (const { reject } of serialWorkerRequestsRef.current.values()) {
+      reject(new Error("串口 Worker 已停止"));
+    }
+    serialWorkerRequestsRef.current.clear();
+    worker?.terminate();
+  }
+
+  function ensureSerialWorker() {
+    if (serialWorkerRef.current) return serialWorkerRef.current;
+    const worker = new Worker(new URL("./trainingSerial.worker.js", import.meta.url), { type: "module" });
+    worker.addEventListener("message", (event) => {
+      const message = event.data || {};
+      if (message.type === "response" && message.requestId) {
+        const pending = serialWorkerRequestsRef.current.get(message.requestId);
+        if (!pending) return;
+        serialWorkerRequestsRef.current.delete(message.requestId);
+        if (message.ok) pending.resolve(message);
+        else {
+          const error = new Error(message.error || "串口 Worker 操作失败");
+          error.code = message.code || "serial_worker_error";
+          pending.reject(error);
+        }
+        return;
+      }
+      serialWorkerMessageHandlerRef.current?.(message);
+    });
+    worker.addEventListener("error", (event) => {
+      const error = new Error(event.message || "串口 Worker 异常退出");
+      for (const { reject } of serialWorkerRequestsRef.current.values()) reject(error);
+      serialWorkerRequestsRef.current.clear();
+      if (serialWorkerRef.current === worker) serialWorkerRef.current = null;
+      worker.terminate();
+      serialWorkerMessageHandlerRef.current?.({ type: "serial_disconnected", error: error.message, workerGone: true });
+    });
+    serialWorkerRef.current = worker;
+    return worker;
+  }
+
+  function requestSerialWorker(type, payload = {}) {
+    const worker = ensureSerialWorker();
+    serialWorkerRequestIdRef.current += 1;
+    const requestId = serialWorkerRequestIdRef.current;
+    return new Promise((resolve, reject) => {
+      serialWorkerRequestsRef.current.set(requestId, { resolve, reject });
+      worker.postMessage({ type, requestId, ...payload });
+    });
+  }
+
+  async function releaseSerialResources({ clear = true, error = "", preserveSamples = false, disposeWorker = false } = {}) {
     serialLoopRef.current = false;
     stopTrainingSerialClaim();
     const reader = readerRef.current;
     const port = portRef.current;
+    const transport = serialTransportRef.current;
     readerRef.current = null;
     portRef.current = null;
+    serialTransportRef.current = "";
 
-    try {
-      await reader?.cancel();
-    } catch {
-      // reader may already be closed
+    if (transport === "worker" && serialWorkerRef.current) {
+      try {
+        await requestSerialWorker("close");
+      } catch {
+        // A crashed worker or removed device is already effectively closed.
+      }
+    } else {
+      try {
+        await reader?.cancel();
+      } catch {
+        // reader may already be closed
+      }
+      try {
+        reader?.releaseLock();
+      } catch {
+        // lock may already be released
+      }
+      try {
+        await port?.close();
+      } catch {
+        // port may already be closed or disconnected
+      }
     }
-    try {
-      reader?.releaseLock();
-    } catch {
-      // lock may already be released
-    }
-    try {
-      await port?.close();
-    } catch {
-      // port may already be closed or disconnected
-    }
+
+    if (disposeWorker) disposeSerialWorker();
 
     if (clear) clearSerialConnection(error, { preserveSamples });
   }
+  releaseSerialResourcesRef.current = releaseSerialResources;
 
   async function openSerialPort(port, { requested = false } = {}) {
     if (!port || audience) return false;
@@ -1131,15 +1216,22 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       if (portRef.current && portRef.current !== port) {
         await releaseSerialResources({ clear: false });
       }
-      // Web Serial defaults to only 255 bytes. A hidden tab can be scheduled
-      // late even when its reader remains active, so leave enough native
-      // headroom to absorb a long scheduling stall without cutting a JSON
-      // object in half. The API requires this value to remain below 16 MiB.
-      await port.open({ baudRate: 115200, bufferSize: SERIAL_PORT_BUFFER_SIZE });
+      const ports = await navigator.serial.getPorts();
+      const descriptor = await rememberTrainingSerialPort(port) || describeSerialPort(port, ports);
+      try {
+        await requestSerialWorker("open", { descriptor });
+        serialTransportRef.current = "worker";
+      } catch (workerError) {
+        if (workerError.code !== "worker_serial_unsupported") throw workerError;
+        // Older Chromium builds may expose Web Serial only on Window. Keep a
+        // compatibility path, but supported production browsers use Worker so
+        // page rendering and background timer throttling cannot stop reads.
+        await port.open({ baudRate: 115200, bufferSize: SERIAL_PORT_BUFFER_SIZE });
+        serialTransportRef.current = "main";
+      }
       manualSerialDisconnectRef.current = false;
       portRef.current = port;
       startTrainingSerialClaim(port);
-      void rememberTrainingSerialPort(port);
       serialLatestRef.current = {};
       requestSerialRender();
       setSerialState((current) => ({
@@ -1157,8 +1249,9 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
         lastLine: "",
         error: "",
       }));
-      pushStatus(requested ? "Serial connected" : "Serial auto-connected");
-      void readSerialLoop(port);
+      const connectionLabel = requested ? "Serial connected" : "Serial auto-connected";
+      pushStatus(`${connectionLabel}${serialTransportRef.current === "worker" ? "（后台持续采集已启用）" : "（兼容模式）"}`);
+      if (serialTransportRef.current === "main") void readSerialLoop(port);
       return true;
     } catch (error) {
       if (portRef.current === port) portRef.current = null;
@@ -1246,16 +1339,17 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
   void saveLive;
 
   const updateSerialFromPacket = useCallback((packet, line, receivedAt = Date.now()) => {
+    const updateUi = serialUiUpdatesAllowed(receivedAt);
     const power = readSerialPower(packet, receivedAt);
     const updatedSamples = parseSerialPacket(packet, receivedAt);
     if (!updatedSamples.length) {
-      if (power) setSerialState((current) => ({ ...current, power }));
+      if (power && updateUi) setSerialState((current) => ({ ...current, power }));
       return [];
     }
     // FPS describes frames actually arriving at this page. The sample timestamp
     // remains authoritative for strips, but it may be old during recovery or
     // differ from the audience device clock.
-    recordSerialInputFrame();
+    recordSerialInputFrame(receivedAt, updateUi);
 
     const latest = { ...serialLatestRef.current };
     for (const sample of updatedSamples) {
@@ -1268,6 +1362,12 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
     }
 
     serialLatestRef.current = latest;
+    // Serial ingestion, history sampling, and relay stay active in the
+    // background. React/rAF updates are presentation-only and are deliberately
+    // suppressed while hidden, and for buffered historical frames delivered
+    // after resume. This prevents background UI work from competing with the
+    // capture path and prevents old stick positions from visibly fast-playing.
+    if (!updateUi) return updatedSamples;
     requestSerialRender();
     const receiverIds = Object.keys(latest).map(Number);
     const lastSample = updatedSamples[updatedSamples.length - 1];
@@ -1304,7 +1404,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
     // A new online packet schedules a 3 s ACK watchdog every 200 ms. It must
     // never postpone an already scheduled 25 ms recovery pump; doing so was the
     // main reason a four-minute cache drained at only about 8-11 packets/s.
-    if (outboxFlushTimerRef.current && outboxFlushDueAtRef.current <= dueAt) return;
+    if (outboxFlushTimerRef.current && shouldKeepScheduledOutboxFlush(outboxFlushDueAtRef.current, dueAt)) return;
     if (outboxFlushTimerRef.current) window.clearTimeout(outboxFlushTimerRef.current);
     outboxFlushDueAtRef.current = dueAt;
     outboxFlushTimerRef.current = window.setTimeout(async () => {
@@ -1396,33 +1496,35 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
         ), null);
         const outboxOrphaned = outboxOrphanedRef.current.size;
         const latestOrphan = [...outboxOrphanedRef.current.values()].at(-1);
-        setLiveRelayState((current) => {
-          const outboxPending = Math.max(recoveryRecords.length, outboxOrphaned);
-          const outboxPendingMore = outboxOrphaned > recoveryRecords.length
-            || (records.length >= 240 && recoveryRecords.length >= 240);
-          if (
-            current.outboxRecovering === outboxRecoveringRef.current
-            && current.outboxPending === outboxPending
-            && current.outboxPendingMore === outboxPendingMore
-            && current.outboxOrphaned === outboxOrphaned
-            && current.outboxActiveEventId === activeEventId
-            && current.outboxOldestEventId === String(oldestRecoveryRecord?.eventId || "")
-            && current.outboxNewestEventId === String(newestRecoveryRecord?.eventId || "")
-            && current.outboxEventGroups === outboxEventGroups
-          ) return current;
-          return {
-            ...current,
-            outboxRecovering: outboxRecoveringRef.current,
-            outboxPending,
-            outboxPendingMore,
-            outboxOrphaned,
-            outboxOrphanReason: latestOrphan?.reason || "",
-            outboxActiveEventId: activeEventId,
-            outboxOldestEventId: String(oldestRecoveryRecord?.eventId || ""),
-            outboxNewestEventId: String(newestRecoveryRecord?.eventId || ""),
-            outboxEventGroups,
-          };
-        });
+        if (serialUiUpdatesAllowed()) {
+          setLiveRelayState((current) => {
+            const outboxPending = Math.max(recoveryRecords.length, outboxOrphaned);
+            const outboxPendingMore = outboxOrphaned > recoveryRecords.length
+              || (records.length >= 240 && recoveryRecords.length >= 240);
+            if (
+              current.outboxRecovering === outboxRecoveringRef.current
+              && current.outboxPending === outboxPending
+              && current.outboxPendingMore === outboxPendingMore
+              && current.outboxOrphaned === outboxOrphaned
+              && current.outboxActiveEventId === activeEventId
+              && current.outboxOldestEventId === String(oldestRecoveryRecord?.eventId || "")
+              && current.outboxNewestEventId === String(newestRecoveryRecord?.eventId || "")
+              && current.outboxEventGroups === outboxEventGroups
+            ) return current;
+            return {
+              ...current,
+              outboxRecovering: outboxRecoveringRef.current,
+              outboxPending,
+              outboxPendingMore,
+              outboxOrphaned,
+              outboxOrphanReason: latestOrphan?.reason || "",
+              outboxActiveEventId: activeEventId,
+              outboxOldestEventId: String(oldestRecoveryRecord?.eventId || ""),
+              outboxNewestEventId: String(newestRecoveryRecord?.eventId || ""),
+              outboxEventGroups,
+            };
+          });
+        }
         // Keep reporting the local cache while offline, but do not consume or
         // mark recovery complete until a server connection can ACK the data.
         if (!socketReady) return;
@@ -1580,6 +1682,8 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
   const publishLivePacket = useCallback((packet, capturedAt = Date.now()) => {
     if (audience) return;
     const now = performance.now();
+    const wallNow = Date.now();
+    const historicalCapture = wallNow - Number(capturedAt || wallNow) >= OUTBOX_ACK_TIMEOUT_MS;
     const minIntervalMs = 30;
     liveRelayRef.current.minIntervalMs = minIntervalMs;
     liveRelayRef.current.lastSentAt = now;
@@ -1602,7 +1706,11 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
 
     if (!shouldSendDurableFrame) {
       const socket = liveSocketRef.current;
-      if (socket?.readyState === 1 && socket.bufferedAmount <= 256 * 1024) {
+      // A Worker can continue reading while the page task queue is frozen.
+      // When queued messages finally reach this page, never fast-play those
+      // old stick positions as current live control. Selected 5 Hz snapshots
+      // below are cached and explicitly replayed as historical backfill.
+      if (!historicalCapture && socket?.readyState === 1 && socket.bufferedAmount <= 256 * 1024) {
         socket.send(JSON.stringify({
           type: "live_batch",
           room: LIVE_ROOM_ID,
@@ -1646,6 +1754,17 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
         liveOnly: true,
         durable: true,
       };
+      const historicalOutgoing = {
+        type: "live_batch",
+        room: LIVE_ROOM_ID,
+        batch: persistenceBatch,
+        clientTime: capturedAt,
+        clientSequence,
+        packetId,
+        eventId: activeEventId,
+        backfill: true,
+        persistOnly: true,
+      };
       outboxWriteChainRef.current = outboxWriteChainRef.current
         .catch(() => undefined)
         .then(async () => {
@@ -1654,9 +1773,11 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
           if (outboxDiscardedEventIdsRef.current.has(activeEventId)) return "discarded";
           try {
             await cacheLivePacket({ packetId, eventId: activeEventId, clientSequence, capturedAt, batch: persistenceBatch });
-            setLiveRelayState((current) => (
-              current.outboxError ? { ...current, outboxError: "" } : current
-            ));
+            if (serialUiUpdatesAllowed(capturedAt)) {
+              setLiveRelayState((current) => (
+                current.outboxError ? { ...current, outboxError: "" } : current
+              ));
+            }
             return "cached";
           } catch (error) {
             const outboxError = `断网缓存写入失败：${error.message || "IndexedDB 不可用"}`;
@@ -1672,8 +1793,28 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
             // Online persistence can still succeed, but explicitly avoid
             // claiming offline safety when the durable browser copy failed.
             if (persistenceSocket?.readyState === 1 && persistenceSocket.bufferedAmount <= 256 * 1024) {
-              persistenceSocket.send(JSON.stringify(outgoing));
+              persistenceSocket.send(JSON.stringify(historicalCapture ? historicalOutgoing : outgoing));
             }
+            return;
+          }
+          if (historicalCapture) {
+            // The serial Worker preserved this frame while the Window was not
+            // scheduled. It is real historical evidence, not the current
+            // sticks. Let the existing IndexedDB recovery pump upload it with
+            // the original capture time and never broadcast it as live data.
+            outboxRecoveringRef.current = true;
+            outboxRecoveryCutoffSequenceRef.current = Math.max(
+              Number(outboxRecoveryCutoffSequenceRef.current) || 0,
+              clientSequence,
+            );
+            outboxRecoveryCutoffCapturedAtRef.current = Math.max(
+              Number(outboxRecoveryCutoffCapturedAtRef.current) || 0,
+              capturedAt,
+            );
+            outboxRecoveryWriteFenceRef.current = outboxWriteChainRef.current;
+            outboxRecoveryHadRecordsRef.current = true;
+            outboxEmptyPassesRef.current = 0;
+            scheduleOutboxFlush(0);
             return;
           }
           if (!shouldSendCurrentPersistence(persistenceSocket?.readyState, outboxRecoveringRef.current)) {
@@ -1701,8 +1842,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
           scheduleOutboxFlush(OUTBOX_ACK_TIMEOUT_MS);
         });
     }
-    const wallNow = Date.now();
-    if (wallNow - (liveRelayRef.current.lastUiAt || 0) >= 250) {
+    if (serialUiUpdatesAllowed(capturedAt) && wallNow - (liveRelayRef.current.lastUiAt || 0) >= 250) {
       liveRelayRef.current.lastUiAt = wallNow;
       setLiveRelayState((current) => ({
         ...current,
@@ -1712,6 +1852,45 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       }));
     }
   }, [audience, scheduleOutboxFlush]);
+
+  useEffect(() => {
+    if (audience) {
+      serialWorkerMessageHandlerRef.current = null;
+      return undefined;
+    }
+    serialWorkerMessageHandlerRef.current = (message) => {
+      if (message.type === "serial_frames") {
+        for (const frame of message.frames || []) {
+          const capturedAt = Number(frame.capturedAt) || Date.now();
+          updateSerialFromPacket(frame.packet, frame.line || JSON.stringify(frame.packet), capturedAt);
+          publishLivePacket(frame.packet, capturedAt);
+        }
+        for (const failedFrame of (message.failures || []).slice(-1)) {
+          const preview = String(failedFrame || "").replace(/\s+/g, " ").slice(0, 80);
+          pushStatus(`串口 JSON 解析失败：${preview}`);
+          setSerialState((current) => ({ ...current, error: `串口 JSON 解析失败：${preview}` }));
+        }
+        return;
+      }
+      if (message.type === "serial_read_warning") {
+        const warning = `串口发生可恢复读取异常，已继续采集：${message.error || "未知错误"}`;
+        pushStatus(warning);
+        setSerialState((current) => ({ ...current, error: warning }));
+        return;
+      }
+      if (message.type === "serial_disconnected" && serialTransportRef.current === "worker") {
+        if (message.workerGone) serialTransportRef.current = "";
+        void releaseSerialResourcesRef.current?.({
+          clear: true,
+          error: message.error || "串口已断开，正在自动重连",
+          preserveSamples: true,
+        });
+      }
+    };
+    return () => {
+      serialWorkerMessageHandlerRef.current = null;
+    };
+  }, [audience, publishLivePacket, updateSerialFromPacket]);
 
   const publishLiveState = useCallback((state) => {
     if (audience) return;
@@ -2121,13 +2300,40 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       scheduleAutoConnect(800);
     }
 
-    function handlePageHide() {
-      void releaseSerialResources({ clear: false });
+    function handleVisibilityChange() {
+      // Browser background scheduling may delay a disconnect notification or
+      // reconnect timer. Re-check every data-plane component immediately when
+      // the operator returns; visibility changes never close the serial port.
+      if (document.visibilityState !== "visible") return;
+      requestSerialRender();
+      scheduleOutboxFlush(0);
+      if (portRef.current) {
+        void claimTrainingSerialPort(portRef.current, serialClaimOwnerRef.current);
+      } else {
+        scheduleAutoConnect(0);
+      }
+    }
+
+    function handlePageFreeze() {
+      pushStatus("浏览器冻结了采集页面；恢复后将检查串口积压并按硬件时间补录");
+    }
+
+    function handlePageResume() {
+      pushStatus("采集页面已恢复，正在检查串口与历史积压");
+      requestSerialRender();
+      scheduleOutboxFlush(0);
+      if (portRef.current) {
+        void claimTrainingSerialPort(portRef.current, serialClaimOwnerRef.current);
+      } else {
+        scheduleAutoConnect(0);
+      }
     }
 
     navigator.serial.addEventListener("connect", handleSerialConnect);
     navigator.serial.addEventListener("disconnect", handleSerialDisconnect);
-    window.addEventListener("pagehide", handlePageHide);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    document.addEventListener("freeze", handlePageFreeze);
+    document.addEventListener("resume", handlePageResume);
     scheduleAutoConnect(0);
     const retryInterval = window.setInterval(() => {
       if (!stopped) void autoConnectSerialArray();
@@ -2139,8 +2345,10 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       window.clearInterval(retryInterval);
       navigator.serial.removeEventListener("connect", handleSerialConnect);
       navigator.serial.removeEventListener("disconnect", handleSerialDisconnect);
-      window.removeEventListener("pagehide", handlePageHide);
-      void releaseSerialResources({ clear: false });
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      document.removeEventListener("freeze", handlePageFreeze);
+      document.removeEventListener("resume", handlePageResume);
+      void releaseSerialResources({ clear: false, disposeWorker: true });
     };
   // Serial listeners are registered once per page mode; helpers read current values from refs.
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2148,6 +2356,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
 
   async function readSerialLoop(port) {
     const decoder = new TextDecoder();
+    const captureClock = createSerialCaptureClock();
     let jsonBuffer = "";
     serialLoopRef.current = true;
     while (serialLoopRef.current && port.readable) {
@@ -2161,7 +2370,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
           const consumed = consumeSerialJsonStream(jsonBuffer, decoded);
           jsonBuffer = consumed.buffer;
           for (const parsed of consumed.frames) {
-            const capturedAt = Date.now();
+            const capturedAt = captureClock.capture(parsed.packet, Date.now());
             updateSerialFromPacket(parsed.packet, parsed.line, capturedAt);
             publishLivePacket(parsed.packet, capturedAt);
           }
@@ -2176,18 +2385,13 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
         }
       } catch (error) {
         if (serialLoopRef.current) {
-          try {
-            reader.releaseLock();
-          } catch {
-            // The stream may already have released its lock after a USB drop.
-          }
-          if (readerRef.current === reader) readerRef.current = null;
-          await releaseSerialResources({
-            clear: true,
-            error: `串口读取失败，正在自动重连：${error.message}`,
-            preserveSamples: true,
-          });
-          return;
+          // Non-fatal Web Serial errors replace port.readable with a fresh
+          // stream. The outer loop acquires it immediately; do not close the
+          // port and wait for a background-throttled reconnect timer.
+          jsonBuffer = "";
+          const warning = `串口发生可恢复读取异常，已继续采集：${error.message}`;
+          pushStatus(warning);
+          setSerialState((current) => ({ ...current, error: warning }));
         }
       } finally {
         try {
@@ -2246,9 +2450,15 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       setSerialState((current) => ({ ...current, error: "", lastCommand: `BIND:${receiverId}（测试模拟）` }));
       return;
     }
-    if (!portRef.current?.writable) {
+    if (!portRef.current) {
       throw new Error("串口未连接");
     }
+    if (serialTransportRef.current === "worker") {
+      await requestSerialWorker("write", { text: `BIND:${receiverId}\n` });
+      setSerialState((current) => ({ ...current, error: "", lastCommand: `BIND:${receiverId}` }));
+      return;
+    }
+    if (!portRef.current.writable) throw new Error("串口未连接");
     const writer = portRef.current.writable.getWriter();
     try {
       await writer.write(new TextEncoder().encode(`BIND:${receiverId}\n`)).catch((error) => {

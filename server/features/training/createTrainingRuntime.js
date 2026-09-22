@@ -697,9 +697,12 @@ function persistProcessedSample(event, pilot, participant, rawSample, runtime, r
     throttleSpread: state.throttleSpread,
   };
 
-  recentBefore.push(sample);
-  runtime.recentByPilot.set(pilotId, recentBefore.slice(-120));
   if (!backfill) {
+    // Recovery reads its own historical context from SQLite. Never replace
+    // the current five-second live window with that old context: the next
+    // online sample would otherwise lose its flying state and cut a gray gap.
+    recentBefore.push(sample);
+    runtime.recentByPilot.set(pilotId, recentBefore.slice(-120));
     serverLiveState.latestSamplesByReceiver[receiverId] = {
       ...sample,
       serverSeenAt: serverLiveState.latestSamplesByReceiver[receiverId]?.serverSeenAt || Date.now(),
@@ -1189,7 +1192,7 @@ function processServerSerialPacket(packet, {
       resolvedBy: "",
       candidateCount: resolution.candidateCount || 0,
       requestedEventMissing: Boolean(resolution.requestedEventMissing),
-      state: maybeBuildServerLiveState(null, serverReceivedAt),
+      state: backfill ? null : maybeBuildServerLiveState(null, serverReceivedAt),
       event: null,
       rawSampleCount: rawSamples.length,
       mappedSampleCount: 0,
@@ -1272,7 +1275,10 @@ function processServerSerialPacket(packet, {
       else if (persistence.skipReason === "out_of_window") outOfWindowSampleCount += 1;
     }
 
-    const state = maybeBuildServerLiveState(event, serverReceivedAt);
+    // Historical uploads never broadcast as live state. Building one here
+    // still runs timeline/stat queries and advances the live broadcast clock,
+    // slowing recovery and suppressing a subsequent current-state update.
+    const state = backfill ? null : maybeBuildServerLiveState(event, serverReceivedAt);
     if (transactionStarted) {
       db.exec("COMMIT");
       transactionStarted = false;
@@ -1309,14 +1315,14 @@ function processServerSerialPacket(packet, {
       db.prepare("DELETE FROM training_ingested_packets WHERE event_id = ? AND packet_id = ?").run(claimedEventId, packetId);
     }
     if (runtimeEventId) runtimeEvents.delete(runtimeEventId);
-    serverLiveState.receiverState.error = error.message || "serial packet processing failed";
+    if (!backfill) serverLiveState.receiverState.error = error.message || "serial packet processing failed";
     return {
       accepted: false,
       ackStatus: "retryable",
       retryable: true,
       rejectReason: "processing_failed",
       error,
-      state: maybeBuildServerLiveState(null, Date.now(), true),
+      state: backfill ? null : maybeBuildServerLiveState(null, Date.now(), true),
       event: null,
     };
   }

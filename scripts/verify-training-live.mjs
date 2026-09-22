@@ -11,8 +11,10 @@ import {
   outboxAckRetryDelay,
   shouldDeleteOutboxPacketForAck,
   shouldDiscardOrphanedOutboxPacket,
+  shouldKeepScheduledOutboxFlush,
   shouldSendCurrentPersistence,
 } from "../src/livePersistence.js";
+import { getPilotState, parseSerialPacket } from "../server/live/sampleProcessing.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "fpv-training-live-"));
@@ -22,9 +24,18 @@ if (!shouldSendCurrentPersistence(1, true) || shouldSendCurrentPersistence(0, fa
   throw new Error("current 5 Hz persistence was blocked by historical outbox recovery");
 }
 if (
+  !shouldKeepScheduledOutboxFlush(snapshotAt + 25, snapshotAt + 3000, snapshotAt)
+  || shouldKeepScheduledOutboxFlush(snapshotAt - 1000, snapshotAt, snapshotAt)
+  || !shouldKeepScheduledOutboxFlush(snapshotAt - 1000, snapshotAt + 3000, snapshotAt)
+  || shouldKeepScheduledOutboxFlush(snapshotAt + 3000, snapshotAt + 25, snapshotAt)
+) {
+  throw new Error("an overdue or later outbox timer blocked the recovery wakeup");
+}
+if (
   !shouldDeleteOutboxPacketForAck({ status: "persisted" })
   || !shouldDeleteOutboxPacketForAck({ status: "processed" })
   || !shouldDeleteOutboxPacketForAck({ status: "duplicate" })
+  || shouldDeleteOutboxPacketForAck({ accepted: true, sampled: false })
   || shouldDeleteOutboxPacketForAck({ status: "orphaned", accepted: true })
   || !shouldDiscardOrphanedOutboxPacket({ status: "orphaned" })
   || shouldDiscardOrphanedOutboxPacket({ status: "retryable" })
@@ -81,6 +92,27 @@ if (extremaSnapshot?.history?.length !== 2 || extremaSnapshot.history.map((item)
 const allowedRawKeys = new Set(["rx", "ch", "lq", "rssi", "t"]);
 if (extremaSnapshot.history.some((item) => Object.keys(item).some((key) => !allowedRawKeys.has(key)))) {
   throw new Error(`persistence history contains browser-derived fields: ${JSON.stringify(extremaSnapshot.history)}`);
+}
+const idleAfterClockPause = buildPersistenceSerialSnapshot({
+  1: { receiverId: 1, time: snapshotAt + 5000, sourceTime: 5300, rawChannels: [992, 992, 992, 992, 1811, 172, 172, 172], lq: 100, rssi: -45 },
+}, snapshotAt + 5000, undefined, {
+  1: [
+    { receiverId: 1, time: snapshotAt + 100, sourceTime: 400, rawChannels: [992, 992, 172, 992, 1811, 172, 172, 172], lq: 100, rssi: -45 },
+    { receiverId: 1, time: snapshotAt + 200, sourceTime: 500, rawChannels: [992, 992, 1811, 992, 1811, 172, 172, 172], lq: 100, rssi: -45 },
+    { receiverId: 1, time: snapshotAt + 5000, sourceTime: 5300, rawChannels: [992, 992, 992, 992, 1811, 172, 172, 172], lq: 100, rssi: -45 },
+  ],
+}, snapshotAt);
+if (idleAfterClockPause.history?.some((item) => item.ch[2] !== 992)) {
+  throw new Error(`an old throttle extreme contaminated a new idle row: ${JSON.stringify(idleAfterClockPause)}`);
+}
+const idleAfterClockPauseSample = parseSerialPacket(idleAfterClockPause, snapshotAt + 5000)[0];
+const idleAfterClockPauseState = getPilotState(
+  { channelConfig: { ch5: [{ type: "arm", min: 1500, max: 2000 }] } },
+  idleAfterClockPauseSample,
+  [idleAfterClockPauseSample],
+);
+if (idleAfterClockPauseState.flying || idleAfterClockPauseState.throttleSpread !== 0) {
+  throw new Error(`stale throttle extrema created a green band in idle: ${JSON.stringify(idleAfterClockPauseState)}`);
 }
 
 function freePort() {
@@ -208,6 +240,123 @@ try {
   if (!liveOnlyStoredSamples.length) {
     throw new Error("30 Hz live stream no longer feeds the server-owned 5 Hz SQLite sampler");
   }
+
+  // A current durable packet is already committed to IndexedDB. Even when
+  // several arrive in one server tick, none may be compacted and ACKed as
+  // accepted before the server actually processes it. Otherwise the browser
+  // deletes history that SQLite never received, leaving permanent white gaps.
+  for (let index = 0; index < 4; index += 1) {
+    publisher.socket.send(JSON.stringify({
+      type: "live_batch",
+      room: "default",
+      batch: rawPacket(1, index % 2 === 0),
+      clientTime: Date.now(),
+      clientSequence: 8000 + index,
+      packetId: `verify:durable-burst:${index}`,
+      eventId: started.event.id,
+      liveOnly: true,
+      durable: true,
+    }));
+  }
+  await delay(500);
+  const durableBurstAcks = publisher.messages.filter((message) => (
+    message.type === "live_packet_ack" && String(message.packetId || "").startsWith("verify:durable-burst:")
+  ));
+  if (
+    durableBurstAcks.length !== 4
+    || durableBurstAcks.some((message) => !message.sampled)
+    || durableBurstAcks.map((message) => message.packetId).join(",")
+      !== Array.from({ length: 4 }, (_, index) => `verify:durable-burst:${index}`).join(",")
+  ) {
+    throw new Error(`current durable packets were ACKed before server processing: ${JSON.stringify(durableBurstAcks)}`);
+  }
+
+  // Regression guard: an earlier implementation inferred backfill whenever a
+  // current durable packet arrived 400 ms slower than the best packet on the
+  // socket. Normal browser/IndexedDB/CSV jitter then increased recovery and
+  // rebuild counters forever even with a healthy network. Only an explicit
+  // `backfill: true` replay is allowed to enter the recovery lane.
+  const onlineJitterStatusBefore = await json("/api/training-csv/status");
+  const onlineJitterBackfillBefore = Number(onlineJitterStatusBefore.ingest?.backfillProcessedPackets || 0);
+  const onlineJitterProgressBefore = Number(onlineJitterStatusBefore.ingest?.backfillProgressPublishCount || 0);
+  const onlineJitterFinalizeBefore = Number(onlineJitterStatusBefore.ingest?.backfillFinalizedCount || 0);
+  for (let index = 0; index < 3; index += 1) {
+    publisher.socket.send(JSON.stringify({
+      type: "live_batch",
+      room: "default",
+      batch: rawPacket(1, index % 2 === 0),
+      clientTime: Date.now() - 1200,
+      clientSequence: 9000 + index,
+      packetId: `verify:online-jitter:${index}`,
+      eventId: started.event.id,
+      liveOnly: true,
+      durable: true,
+    }));
+    await delay(220);
+  }
+  await delay(1700);
+  const onlineJitterStatusAfter = await json("/api/training-csv/status");
+  if (
+    Number(onlineJitterStatusAfter.ingest?.backfillProcessedPackets || 0) !== onlineJitterBackfillBefore
+    || Number(onlineJitterStatusAfter.ingest?.backfillProgressPublishCount || 0) !== onlineJitterProgressBefore
+    || Number(onlineJitterStatusAfter.ingest?.backfillFinalizedCount || 0) !== onlineJitterFinalizeBefore
+  ) {
+    throw new Error(`delayed online durable frames entered recovery: ${JSON.stringify({
+      before: onlineJitterStatusBefore.ingest,
+      after: onlineJitterStatusAfter.ingest,
+    })}`);
+  }
+  const onlineJitterAcks = publisher.messages.filter((message) => (
+    message.type === "live_packet_ack"
+    && String(message.packetId || "").startsWith("verify:online-jitter:")
+    && ["persisted", "processed", "duplicate"].includes(message.status)
+  ));
+  if (onlineJitterAcks.length !== 3) {
+    throw new Error(`delayed online durable frames were not acknowledged on the current path: ${onlineJitterAcks.length}/3`);
+  }
+
+  // Normal online flight must stay continuous when the 5 Hz selected value is
+  // centered but genuine 30 Hz movement occurred inside each 200 ms window.
+  // This is the production shape emitted by buildPersistenceSerialSnapshot.
+  const continuousFlightAt = Date.now();
+  for (let index = 0; index < 12; index += 1) {
+    const packet = rawPacket(1, false);
+    packet.items[0].ch[2] = 992;
+    packet.history = [
+      { ...packet.items[0], ch: [...packet.items[0].ch.slice(0, 2), 172, ...packet.items[0].ch.slice(3)], t: index * 200 + 1 },
+      { ...packet.items[0], ch: [...packet.items[0].ch.slice(0, 2), 1811, ...packet.items[0].ch.slice(3)], t: index * 200 + 2 },
+    ];
+    publisher.socket.send(JSON.stringify({
+      type: "live_batch",
+      room: "default",
+      batch: packet,
+      clientTime: Date.now(),
+      clientSequence: 9100 + index,
+      packetId: `verify:continuous-online-flight:${index}`,
+      eventId: started.event.id,
+      liveOnly: true,
+      durable: true,
+    }));
+    await delay(220);
+  }
+  await delay(400);
+  const continuousFlightSamples = (await json(
+    `/api/training-events/${started.event.id}/samples?since=${continuousFlightAt - 100}`,
+  )).filter((sample) => Number(sample.time) >= continuousFlightAt - 100);
+  const continuousFlightGaps = continuousFlightSamples.slice(1).map((sample, index) => (
+    Number(sample.time) - Number(continuousFlightSamples[index].time)
+  ));
+  if (
+    continuousFlightSamples.length < 10
+    || continuousFlightSamples.some((sample) => !sample.flying)
+    || continuousFlightGaps.some((gap) => gap > 1000)
+  ) {
+    throw new Error(`healthy online flight strip became sparse: ${JSON.stringify({
+      sampleCount: continuousFlightSamples.length,
+      idleSamples: continuousFlightSamples.filter((sample) => !sample.flying).length,
+      maxGapMs: Math.max(0, ...continuousFlightGaps),
+    })}`);
+  }
   const historicalCapturedAt = startedAt + 1000;
   publisher.socket.send(JSON.stringify({
     type: "live_batch",
@@ -219,6 +368,39 @@ try {
     eventId: started.event.id,
     backfill: true,
   }));
+  for (let attempt = 0; attempt < 40 && !publisher.messages.some((message) => (
+    message.type === "live_packet_ack" && message.packetId === "verify:historical-backfill"
+  )); attempt += 1) await delay(50);
+  if (!publisher.messages.some((message) => (
+    message.type === "live_packet_ack" && message.packetId === "verify:historical-backfill"
+  ))) throw new Error("historical backfill was not acknowledged before the live-context check");
+  // Let the 200 ms SQLite sampler accept this candidate even if another
+  // current packet happened just before the historical ACK.
+  await delay(250);
+  const liveAfterBackfillAt = Date.now();
+  for (let index = 0; index < 3; index += 1) {
+    const liveAfterBackfill = rawPacket(1, false);
+    liveAfterBackfill.items[0].ch[2] = 992;
+    publisher.socket.send(JSON.stringify({
+      type: "live_batch",
+      room: "default",
+      batch: liveAfterBackfill,
+      clientTime: Date.now(),
+      clientSequence: 9200 + index,
+      packetId: `verify:live-after-historical-backfill:${index}`,
+      eventId: started.event.id,
+      liveOnly: true,
+      durable: true,
+    }));
+    await delay(250);
+  }
+  await delay(350);
+  const liveAfterBackfillSamples = await json(
+    `/api/training-events/${started.event.id}/samples?since=${liveAfterBackfillAt - 50}`,
+  );
+  if (!liveAfterBackfillSamples.some((sample) => Number(sample.time) >= liveAfterBackfillAt + 200 && sample.flying)) {
+    throw new Error(`historical backfill replaced the current 5-second flight-state context: ${JSON.stringify(liveAfterBackfillSamples.slice(-3))}`);
+  }
   for (let index = 0; index < 30; index += 1) {
     publisher.socket.send(JSON.stringify({
       type: "live_batch",

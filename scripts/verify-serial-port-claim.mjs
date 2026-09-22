@@ -46,10 +46,27 @@ const {
   releaseBetaflightSerialPortClaim,
   releaseTrainingSerialPortClaim,
   rememberTrainingSerialPort,
+  TRAINING_SERIAL_CLAIM_HEARTBEAT_MS,
+  TRAINING_SERIAL_CLAIM_TTL_MS,
 } = await import("../src/serialPortClaim.js");
 
 const claim = await claimTrainingSerialPort(receiverTwo, "test-owner");
 assert.equal(claim.ordinal, 1, "identical VID/PID ports must be distinguished by ordinal");
+assert.ok(
+  TRAINING_SERIAL_CLAIM_TTL_MS > 60_000,
+  "serial ownership must survive Chromium's one-minute background timer throttling",
+);
+assert.ok(
+  TRAINING_SERIAL_CLAIM_HEARTBEAT_MS * 2 < TRAINING_SERIAL_CLAIM_TTL_MS,
+  "serial claim heartbeat must have ample scheduling margin before expiry",
+);
+assert.ok(readTrainingSerialClaim(claim.updatedAt + TRAINING_SERIAL_CLAIM_TTL_MS - 1));
+assert.equal(
+  readTrainingSerialClaim(claim.updatedAt + TRAINING_SERIAL_CLAIM_TTL_MS + 1),
+  null,
+  "a crashed owner must eventually release its advisory claim",
+);
+await claimTrainingSerialPort(receiverTwo, "test-owner");
 assert.equal(await isTrainingSerialPortClaimed(receiverOne), false);
 assert.equal(await isTrainingSerialPortClaimed(receiverTwo), true);
 assert.deepEqual(await listUnclaimedAuthorizedSerialPorts(), [receiverOne, flightController]);

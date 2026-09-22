@@ -1,4 +1,5 @@
 const DEFAULT_RECENT_SAMPLE_MS = 2500;
+const MAX_RAW_EXTREMA_WINDOW_MS = 500;
 
 // A recovery backlog changes how old cached records are replayed, but it must
 // never change delivery of the current 5 Hz sample. Keeping this decision in a
@@ -8,9 +9,24 @@ export function shouldSendCurrentPersistence(socketReadyState, recoveryActive = 
   return socketReadyState === 1;
 }
 
+// A hidden tab may leave a timer overdue but not yet dispatched. An ACK or
+// visibility wakeup must replace that stalled timer instead of treating its
+// old deadline as proof that the recovery pump is already running.
+export function shouldKeepScheduledOutboxFlush(existingDueAt, requestedDueAt, now = Date.now()) {
+  const existing = Number(existingDueAt);
+  const requested = Number(requestedDueAt);
+  // Current 5 Hz frames also schedule a three-second ACK watchdog. That late
+  // request must never replace an overdue recovery pump; only a fresh
+  // immediate wakeup (ACK, reconnect, visibility) should do so.
+  return existing <= requested && (existing > Number(now) || requested > Number(now));
+}
+
 const OUTBOX_SUCCESS_ACK_STATUSES = new Set(["persisted", "processed", "duplicate"]);
 
 export function shouldDeleteOutboxPacketForAck(message) {
+  // Older servers could ACK a compacted durable frame as accepted even though
+  // it was never sampled. Keep the IndexedDB record for explicit replay.
+  if (message?.sampled === false) return false;
   const status = String(message?.status || "");
   if (status) return OUTBOX_SUCCESS_ACK_STATUSES.has(status);
   // Compatibility with a rolling deployment where the browser can reconnect
@@ -86,11 +102,21 @@ export function buildPersistenceSerialSnapshot(
   if (!items.length) return null;
   const itemReceiverIds = new Set(items.map((item) => item.rx));
   const history = [];
+  // A durable row represents one approximately 200 ms sample window. After
+  // a serial clock reset or a long scheduling pause, the previous durable
+  // timestamp can be seconds old. Including every queued raw sample since
+  // then imports a former throttle movement into a *current idle* row, whose
+  // five-second server state window then paints a false green interval. Keep
+  // the true raw extrema, but only from the bounded window of this row.
+  const extremaWindowStartedAt = Math.max(
+    Number(windowStartedAt) || 0,
+    capturedAt - MAX_RAW_EXTREMA_WINDOW_MS,
+  );
   for (const [receiverKey, queuedSamples] of Object.entries(samplesByReceiver || {})) {
     const receiverId = Number(receiverKey);
     if (!itemReceiverIds.has(receiverId) || !Array.isArray(queuedSamples)) continue;
     const candidates = queuedSamples.filter((sample) => (
-      Number(sample?.time) > Number(windowStartedAt || 0)
+      Number(sample?.time) > extremaWindowStartedAt
       && Number(sample?.time) <= capturedAt
       && Number(sample?.receiverId) === receiverId
       && Array.isArray(sample?.rawChannels)

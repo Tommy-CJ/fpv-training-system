@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createSerialCaptureClock } from "../src/serialCaptureClock.js";
 import { consumeSerialJsonStream } from "../src/serialJsonStream.js";
 
 const firstPacket = {
@@ -74,4 +75,46 @@ state = consumeSerialJsonStream("", JSON.stringify(packetWithHeaderText));
 assert.equal(state.failures.length, 0, "a packet-shaped string value must not trigger resynchronization");
 assert.deepEqual(state.frames.map(({ packet }) => packet), [packetWithHeaderText], "string content corrupted a valid packet");
 
-console.log(JSON.stringify({ ok: true, reassembledReceivers: firstPacket.items.length, concatenatedFrames: 2, truncatedRecovery: true }));
+const captureClock = createSerialCaptureClock();
+assert.equal(captureClock.capture({ t: 1000 }, 10_000), 10_000, "first hardware timestamp must anchor to wall time");
+assert.equal(captureClock.capture({ t: 1100 }, 10_100), 10_100, "foreground timing must retain its source spacing");
+assert.equal(
+  captureClock.capture({ t: 1200 }, 20_000),
+  10_200,
+  "frames buffered while the page is suspended must keep their hardware-time spacing",
+);
+assert.equal(captureClock.capture({ t: 1300 }, 20_001), 10_300, "a buffered burst must not collapse onto one Date.now()");
+assert.equal(captureClock.capture({ t: 50 }, 20_100), 20_100, "a hardware clock reset must establish a new wall-time anchor");
+assert.equal(captureClock.capture({ t: 150 }, 20_220), 20_220, "live frames must re-anchor so hardware oscillator drift cannot accumulate");
+
+const jitterClock = createSerialCaptureClock();
+let jitterSourceAt = 1000;
+let jitterObservedAt = 10_000;
+jitterClock.capture({ t: jitterSourceAt }, jitterObservedAt);
+let largestJitterGap = 0;
+let previousJitterCapture = jitterObservedAt;
+for (let index = 0; index < 120; index += 1) {
+  jitterSourceAt += 200;
+  jitterObservedAt += index % 10 === 0 ? 600 : 200;
+  const capturedAt = jitterClock.capture({ t: jitterSourceAt }, jitterObservedAt);
+  largestJitterGap = Math.max(largestJitterGap, capturedAt - previousJitterCapture);
+  previousJitterCapture = capturedAt;
+}
+assert.ok(
+  jitterObservedAt - previousJitterCapture < 3000,
+  "repeated foreground scheduling pauses must not turn live frames into permanent historical backfill",
+);
+assert.ok(largestJitterGap <= 1000, "catching up must not invent a real timeline gap");
+
+const burstClock = createSerialCaptureClock();
+burstClock.capture({ t: 1000 }, 10_000);
+const burstCapture = burstClock.capture({ t: 1200 }, 20_000);
+for (let index = 2; index <= 10; index += 1) {
+  assert.equal(
+    burstClock.capture({ t: 1000 + index * 200 }, 20_000 + index),
+    burstCapture + (index - 1) * 200,
+    "a real buffered burst must retain the source interval while it drains",
+  );
+}
+
+console.log(JSON.stringify({ ok: true, reassembledReceivers: firstPacket.items.length, concatenatedFrames: 2, truncatedRecovery: true, bufferedTimeRecovery: true }));
