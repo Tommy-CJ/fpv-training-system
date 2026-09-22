@@ -1,3 +1,13 @@
+import { getCoachPassword } from "./authConfig.js";
+
+function authHeaders(extra = {}) {
+  const password = getCoachPassword();
+  return {
+    ...(password ? { "x-coach-password": password } : {}),
+    ...extra,
+  };
+}
+
 export const buttonStyle = {
   height: 38,
   borderRadius: 10,
@@ -64,7 +74,7 @@ export const videoChannels = {
 
 export async function apiGet(path, fallback) {
   try {
-    const response = await fetch(path, { cache: "no-store" });
+    const response = await fetch(path, { cache: "no-store", headers: authHeaders() });
     if (!response.ok) throw new Error("request failed");
     return await response.json();
   } catch {
@@ -74,6 +84,12 @@ export async function apiGet(path, fallback) {
 
 function errorMessageFromResponseText(text, status) {
   if (!text) return `HTTP ${status}`;
+  const trimmed = text.trim();
+  if (trimmed.startsWith("<!doctype") || trimmed.startsWith("<!DOCTYPE") || trimmed.startsWith("<html")) {
+    const match = trimmed.match(/<pre>(.*?)<\/pre>/is);
+    const message = match ? match[1].replace(/<br\s*\/?>/gi, "\n").replace(/&nbsp;/g, " ").replace(/<[^>]+>/g, "").trim() : "";
+    return message || `后端返回 HTML 错误页，HTTP ${status}`;
+  }
   try {
     const payload = JSON.parse(text);
     return payload.error || payload.message || text;
@@ -85,7 +101,7 @@ function errorMessageFromResponseText(text, status) {
 export async function apiPost(path, data) {
   const response = await fetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(data),
   });
   if (!response.ok) {
@@ -98,7 +114,7 @@ export async function apiPost(path, data) {
 export async function apiPut(path, data) {
   const response = await fetch(path, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(data),
   });
   if (!response.ok) {
@@ -109,7 +125,7 @@ export async function apiPut(path, data) {
 }
 
 export async function apiDelete(path) {
-  const response = await fetch(path, { method: "DELETE" });
+  const response = await fetch(path, { method: "DELETE", headers: authHeaders() });
   if (!response.ok) {
     const text = await response.text();
     throw new Error(errorMessageFromResponseText(text, response.status));

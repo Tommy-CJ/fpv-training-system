@@ -193,9 +193,9 @@ function LlmConfigCard({ config, apiKeyInput, status, onChange, onApiKeyChange, 
     <details style={panelStyle}>
       <summary style={{ cursor: "pointer", listStyle: "none", display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
         <div>
-          <div style={{ fontWeight: 950, color: "#0f172a", fontSize: 16 }}>LLM 模型接口</div>
+          <h2 style={{ marginTop: 0, color: "#0f172a", fontWeight: 900, textAlign: "left" }}>大模型接口</h2>
           <div style={{ color: "#64748b", fontSize: 13, marginTop: 3 }}>
-            Structured Outputs JSON：message / priority / speakable / reason
+            配置接口地址、模型、API Key 等信息
           </div>
         </div>
         <span style={{ color: config?.enabled ? "#047857" : "#64748b", fontSize: 12, fontWeight: 900 }}>
@@ -210,6 +210,14 @@ function LlmConfigCard({ config, apiKeyInput, status, onChange, onApiKeyChange, 
             onChange={(event) => onChange("enabled", event.target.checked)}
           />
           启用 LLM 建议
+        </label>
+        <label style={{ display: "inline-flex", gap: 8, alignItems: "center", color: "#334155", fontWeight: 900, fontSize: 13 }}>
+          <input
+            type="checkbox"
+            checked={config?.thinkingEnabled !== false}
+            onChange={(event) => onChange("thinkingEnabled", event.target.checked)}
+          />
+          启用思考模式
         </label>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: 10 }}>
           <label style={{ display: "grid", gap: 4, fontSize: 12, color: "#64748b" }}>
@@ -309,8 +317,10 @@ export default function CoachPage() {
       setLlmConfig(saved);
       setApiKeyInput("");
       setLlmStatus("LLM 配置已保存");
+      return saved;
     } catch (error) {
       setLlmStatus(`保存失败：${error.message}`);
+      throw error;
     }
   }
 
@@ -319,6 +329,7 @@ export default function CoachPage() {
     setGeneratingPilotId(pilot.pilotId);
     setLlmStatus(`${pilot.pilotName || pilot.pilotId} 正在生成 AI 建议...`);
     try {
+      await saveLlmConfig();
       await apiPost(`/api/coach/llm-suggestions/${encodeURIComponent(pilot.pilotId)}`, {});
       setLlmStatus("AI 建议已生成");
       await loadSnapshot();
@@ -333,6 +344,7 @@ export default function CoachPage() {
     setGeneratingSummary(true);
     setLlmStatus("正在生成本场总结...");
     try {
+      await saveLlmConfig();
       await apiPost("/api/coach/event-summary", {});
       setLlmStatus("本场总结已生成");
       await loadSnapshot();
@@ -380,9 +392,9 @@ export default function CoachPage() {
       <section style={panelStyle}>
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <div>
-            <h2 style={{ margin: 0, fontSize: 22, color: "#0f172a" }}>AI助教</h2>
+            <h2 style={{ marginTop: 0, color: "#0f172a", fontWeight: 900, textAlign: "left" }}>AI助教</h2>
             <div style={{ color: "#64748b", fontSize: 13, marginTop: 4 }}>
-              只读 SQLite 训练段生成内存快照，不参与实时中继和采样写入。
+              AI助教会分析飞手的训练状态，提供个性化建议。
             </div>
           </div>
           <button type="button" style={primaryButtonStyle} onClick={loadSnapshot}>刷新</button>
@@ -447,10 +459,7 @@ export default function CoachPage() {
                   <div key={item} style={{ color: "#475569", fontSize: 13, marginTop: 4 }}>- {item}</div>
                 ))}
               </div>
-              <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", alignItems: "center", border: "1px solid #dbeafe", borderRadius: 8, padding: 10, background: "#eff6ff" }}>
-                <span style={{ color: "#1d4ed8", fontWeight: 900 }}>播报总结：{eventSummary.speakableSummary}</span>
-                <span style={{ color: "#64748b", fontSize: 12 }}>{formatDateTime(eventSummary.generatedAt)}</span>
-              </div>
+              <div style={{ color: "#64748b", fontSize: 12 }}>{formatDateTime(eventSummary.generatedAt)}</div>
             </div>
           )}
         </section>

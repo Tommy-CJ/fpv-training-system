@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { DEFAULT_TRANSPORT_CONFIG, EQUIPMENT_TYPES, displayTaskName } from "../../transportPlanner.js";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { apiDelete, apiGet, apiPost, apiPut, buttonStyle, dangerButtonStyle, inputStyle, panelStyle, primaryButtonStyle } from "../trainingShared.js";
+import { DEFAULT_TRANSPORT_CONFIG, EQUIPMENT_TYPES, displayTaskName } from "../transportShared.js";
 
 const equipmentTypes = [...EQUIPMENT_TYPES, { key: "flag", label: "刀旗" }].filter((item, index, list) => list.findIndex((entry) => entry.key === item.key) === index);
 const equipmentNames = Object.fromEntries(equipmentTypes.map((item) => [item.key, item.label]));
@@ -50,22 +50,26 @@ function equipmentSummary(equipment = []) {
   return visible.length ? visible.map((row) => `${equipmentNames[row.equipment_type] || row.equipment_type} ${row.final_quantity}`).join(" / ") : "暂无器材";
 }
 
+function equipmentCounts(equipment = []) {
+  return Object.fromEntries((equipment || []).map((row) => [row.equipment_type, Number(row.final_quantity || 0)]));
+}
+
+function plansByPeopleCount(plans = []) {
+  const seenCounts = new Set();
+  return (plans || [])
+    .slice()
+    .sort((left, right) => (left.used_people_count || 0) - (right.used_people_count || 0))
+    .filter((plan) => {
+      const key = plan.used_people_count;
+      if (seenCounts.has(key)) return false;
+      seenCounts.add(key);
+      return true;
+    });
+}
+
 function trackReadiness(track) {
   const readiness = track?.overlayJson?.data?.readiness || track?.overlayJson?.readiness || null;
   return readiness || null;
-}
-
-function readinessIssueText(issue) {
-  const type = typeof issue === "string" ? issue : issue?.type;
-  return ({
-    "missing-start-finish": "缺少起终点计时点",
-    "duplicate-start-finish": "起终点计时点重复",
-    "missing-route": "缺少赛道路线",
-    "multiple-routes": "存在多条路线",
-    "duplicate-timing-id": "计时点 ID 重复",
-    "missing-split-id": "分段计时点缺少 ID",
-    "timing-point-off-route": "计时点不在路线附近",
-  })[type] || type || "未知问题";
 }
 
 function taskColor(job) {
@@ -105,9 +109,6 @@ export function TransportPlanView({ planRecord, compact = false, mobile = false 
   }
   const people = plan.people || [];
   const maxT = Math.max(1, Number(plan.makespan) || 1);
-  const rowStep = 54;
-  const barTop = 4;
-  const barHeight = 26;
   const laneOffset = mobile ? 58 : 100;
   const baseLaneW = mobile ? 300 : compact ? 640 : 780;
   const laneWidth = Math.max(mobile ? 180 : 320, ganttW > 0 ? ganttW - laneOffset - 30 : baseLaneW);
@@ -222,7 +223,7 @@ function TrackPreview({ track, height = 600, cropped = false, showLink = true, m
   );
 }
 
-function TrackForm({ value, onChange, onSave, saving }) {
+function TrackForm({ value, onChange, onSave, saving, onUploadImage, uploadingImage }) {
   function normalizeEmbedInput(raw) {
     const text = String(raw || "");
     const src = text.match(/src=["']([^"']+)["']/i)?.[1];
@@ -234,17 +235,31 @@ function TrackForm({ value, onChange, onSave, saving }) {
       <h2 style={{ marginTop: 0, color: "#0f172a", fontWeight: 900, textAlign: "left" }}>{value.id ? "编辑赛道" : "新建赛道"}</h2>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: 10 }}>
         <label style={{ ...fieldStyle(), gridColumn: "1 / -1" }}>
-          <span>TrackDraw Project ID</span>
-          <input style={inputStyle} value={value.trackdrawProjectId || ""} placeholder="例如 FdVRYEY8f32w_5c00tFbg" onChange={(event) => onChange({ ...value, trackdrawProjectId: event.target.value.trim() })} />
+          <span>TrackDraw API ID</span>
+          <input style={inputStyle} value={value.trackdrawProjectId || ""} placeholder="在Project处查看API ID" onChange={(event) => onChange({ ...value, trackdrawProjectId: event.target.value.trim() })} />
         </label>
         <label style={{ ...fieldStyle(), gridColumn: "1 / -1" }}>
           <span>TrackDraw 预览链接</span>
           <input style={inputStyle} value={value.trackdrawEmbedUrl || ""} placeholder={'可粘贴 https://trackdraw.app/embed/... 或完整 <iframe src="..."></iframe>'} onChange={(event) => onChange({ ...value, trackdrawEmbedUrl: normalizeEmbedInput(event.target.value) })} />
         </label>
+        <label style={{ ...fieldStyle(), gridColumn: "1 / -1" }}>
+          <span>赛道图片</span>
+          <div style={{ display: "grid", gap: 8 }}>
+            <label style={{ ...inputStyle, display: "flex", alignItems: "center", gap: 8, cursor: !value.id || uploadingImage ? "not-allowed" : "pointer", opacity: !value.id || uploadingImage ? 0.55 : 1, boxSizing: "border-box" }}>
+            <span style={{ ...buttonStyle, height: 24, padding: "0 8px", fontSize: 12, display: "inline-flex", alignItems: "center" }}>选择文件</span>
+            <span style={{ fontSize: 12, color: "#64748b" }}>未选择文件</span>
+            <input type="file" accept="image/png,image/jpeg,image/webp" disabled={!value.id || uploadingImage} onChange={(event) => onUploadImage?.(event.target.files?.[0])} style={{ display: "none" }} />
+            </label>
+            {!value.id && <span style={{ color: "#94a3b8", textAlign: "center" }}>先保存赛道后再上传图片。</span>}
+          </div>
+
+
+
+        </label>
       </div>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end", marginTop: 12 }}>
         <a href="https://trackdraw.app" target="_blank" rel="noreferrer" style={{ ...buttonStyle, display: "inline-flex", alignItems: "center", textDecoration: "none" }}>打开 TrackDraw</a>
-        <button type="button" style={primaryButtonStyle} onClick={onSave} disabled={saving}>{saving ? "保存中..." : "保存"}</button>
+        <button type="button" style={primaryButtonStyle} onClick={onSave} disabled={saving}>{saving ? "保存中..." : uploadingImage ? "图片上传中..." : "保存"}</button>
       </div>
     </section>
   );
@@ -253,10 +268,6 @@ function TrackForm({ value, onChange, onSave, saving }) {
 function EquipmentEditor({ track, onSaved }) {
   const [rows, setRows] = useState(track?.equipment || []);
   const [status, setStatus] = useState("");
-
-  useEffect(() => {
-    setRows(track?.equipment || []);
-  }, [track?.id, track?.equipment]);
 
   async function save() {
     setStatus("正在保存器材修正...");
@@ -274,7 +285,7 @@ function EquipmentEditor({ track, onSaved }) {
     <section style={panelStyle}>
       <details open>
         <summary style={{ cursor: "pointer", fontWeight: 950, fontSize: 16, color: "#0f172a", padding: "4px 0", listStyle: "none" }}>
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>器材统计<span style={{ fontSize: 12, color: "#64748b", fontWeight: 400 }}>▸ 搬运计算优先使用人工修正数量</span></span>
+          <span style={{ display: "inline-flex", alignItems: "left", gap: 8 }}>器材统计<span style={{ fontSize: 14, color: "#64748b", fontWeight: 400 }}>可人工修正数量</span></span>
         </summary>
         <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
           <button type="button" style={primaryButtonStyle} onClick={save}>保存修正</button>
@@ -317,10 +328,6 @@ function EquipmentEditor({ track, onSaved }) {
 function UnknownObjectEditor({ track, onSaved }) {
   const [items, setItems] = useState(track?.unknownObjects || []);
   const [status, setStatus] = useState("");
-
-  useEffect(() => {
-    setItems(track?.unknownObjects || []);
-  }, [track?.id, track?.unknownObjects]);
 
   async function save() {
     setStatus("正在保存未识别对象处理...");
@@ -374,23 +381,9 @@ function UnknownObjectEditor({ track, onSaved }) {
 }
 
 function TransportPlanner({ track, onSaved }) {
-  const [config, setConfig] = useState(() => ({ ...DEFAULT_TRANSPORT_CONFIG, counts: {} }));
-  const [plans, setPlans] = useState(track?.transportPlans || []);
+  const [config, setConfig] = useState(() => ({ ...DEFAULT_TRANSPORT_CONFIG, counts: equipmentCounts(track?.equipment) }));
+  const [plans, setPlans] = useState(() => plansByPeopleCount(track?.transportPlans));
   const [status, setStatus] = useState("");
-
-  useEffect(() => {
-    const counts = {};
-    for (const row of track?.equipment || []) counts[row.equipment_type] = Number(row.final_quantity || 0);
-    setConfig((current) => ({ ...current, counts, rules: current.rules || DEFAULT_TRANSPORT_CONFIG.rules }));
-    const sorted = (track?.transportPlans || []).slice().sort((a, b) => (a.used_people_count || 0) - (b.used_people_count || 0));
-    const deduped = [];
-    const seenCounts = new Set();
-    for (const plan of sorted) {
-      const key = plan.used_people_count;
-      if (!seenCounts.has(key)) { seenCounts.add(key); deduped.push(plan); }
-    }
-    setPlans(deduped);
-  }, [track?.id, track?.equipment, track?.transportPlans]);
 
   useEffect(() => {
     let stopped = false;
@@ -469,7 +462,7 @@ function TransportPlanner({ track, onSaved }) {
     <section style={panelStyle}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
         <div>
-          <h3 style={{ margin: 0, color: "#0f172a" }}>搬运规划</h3>
+          <h2 style={{ marginTop: 0, color: "#0f172a", fontWeight: 900, textAlign: "left" }}>搬运规划</h2>
           <div style={{ color: "#64748b", fontSize: 13, marginTop: 4 }}>{equipmentSummary(track?.equipment)}</div>
         </div>
         <button type="button" style={primaryButtonStyle} onClick={calculate}>计算搬运方案</button>
@@ -480,11 +473,8 @@ function TransportPlanner({ track, onSaved }) {
           <label style={fieldStyle()}><span>起始人数</span><input type="number" style={inputStyle} value={config.peopleStart} onChange={(e) => setParam("peopleStart", Number(e.target.value))} /></label>
           <label style={fieldStyle()}><span>小车数量</span><input type="number" style={inputStyle} value={config.carts} onChange={(e) => setParam("carts", Number(e.target.value))} /></label>
           <label style={fieldStyle()}><span>每人最多趟数</span><input type="number" style={inputStyle} value={config.maxTrips} onChange={(e) => setParam("maxTrips", Number(e.target.value))} /></label>
-          <label style={fieldStyle()}><span>搜索节点上限</span><input type="number" style={inputStyle} value={config.nodeLimit} onChange={(e) => setParam("nodeLimit", Number(e.target.value))} /></label>
-          <label style={{ display: "inline-flex", gap: 8, alignItems: "center", color: "#334155", fontWeight: 900, fontSize: 13 }}>
-            <input type="checkbox" checked={Boolean(config.wind)} onChange={(e) => setParam("wind", e.target.checked)} />风大，单门也需要沙包
-          </label>
           <label style={fieldStyle()}><span>沙包数量修正</span><input type="number" placeholder="空=自动" style={inputStyle} value={config.sandbags ?? ""} onChange={(e) => setParam("sandbags", e.target.value === "" ? null : Number(e.target.value))} /></label>
+          <label style={fieldStyle()}><span>搜索节点上限</span><input type="number" style={inputStyle} value={config.nodeLimit} onChange={(e) => setParam("nodeLimit", Number(e.target.value))} /></label>
           <label style={fieldStyle()}><span>单门普通候选/趟</span><input type="number" style={inputStyle} value={config.params?.singleQtyNormal ?? 4} onChange={(e) => setNested("params", "singleQtyNormal", Number(e.target.value))} /></label>
           <label style={fieldStyle()}><span>单门最大候选/趟</span><input type="number" style={inputStyle} value={config.params?.singleQtyMax ?? 5} onChange={(e) => setNested("params", "singleQtyMax", Number(e.target.value))} /></label>
           <label style={fieldStyle()}><span>单门2人时间系数</span><input type="number" step="0.01" style={inputStyle} value={config.params?.singleTwoPeopleCoef ?? 0.9} onChange={(e) => setNested("params", "singleTwoPeopleCoef", Number(e.target.value))} /></label>
@@ -501,7 +491,19 @@ function TransportPlanner({ track, onSaved }) {
           <label style={fieldStyle()}><span>难度负担权重</span><input type="number" style={inputStyle} value={config.params?.wFatigue ?? 18} onChange={(e) => setNested("params", "wFatigue", Number(e.target.value))} /></label>
           <label style={fieldStyle()}><span>高难连续权重</span><input type="number" style={inputStyle} value={config.params?.wHardStreak ?? 25} onChange={(e) => setNested("params", "wHardStreak", Number(e.target.value))} /></label>
           <label style={fieldStyle()}><span>趟数均衡权重</span><input type="number" style={inputStyle} value={config.params?.wTripBalance ?? 45} onChange={(e) => setNested("params", "wTripBalance", Number(e.target.value))} /></label>
+
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
+          <input
+            type="checkbox"
+            style={{ marginTop: 30 }}
+            checked={Boolean(config.wind)}
+            onChange={(e) => setParam("wind", e.target.checked)}
+          />
+          <span style={{ marginTop: 25 }}>风大，单门也需要沙包</span>
+          </label>
+
         </div>
+
         <div style={{ marginTop: 14, overflowX: "auto" }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
             <strong style={{ color: "#0f172a" }}>器材搬运规则</strong>
@@ -623,8 +625,9 @@ export default function TrackManagementPage() {
   const [form, setForm] = useState({ name: "", location: "", note: "", trackdrawEmbedUrl: "", trackdrawProjectId: "" });
   const [status, setStatus] = useState("正在读取赛道...");
   const [saving, setSaving] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
 
-  async function loadTracks(nextSelectedId = selectedId) {
+  const loadTracks = useCallback(async (nextSelectedId = "") => {
     const list = await apiGet("/api/tracks", []);
     setTracks(Array.isArray(list) ? list : []);
     const pick = nextSelectedId || list?.[0]?.id || "";
@@ -638,11 +641,12 @@ export default function TrackManagementPage() {
       setForm({ name: "", location: "", note: "", trackdrawEmbedUrl: "", trackdrawProjectId: "" });
     }
     setStatus("赛道数据已读取");
-  }
+  }, []);
 
   useEffect(() => {
-    loadTracks("");
-  }, []);
+    const timer = window.setTimeout(() => { void loadTracks(""); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [loadTracks]);
 
   async function selectTrack(id) {
     setSelectedId(id);
@@ -664,6 +668,7 @@ export default function TrackManagementPage() {
       const payload = {
         trackdrawEmbedUrl: form.trackdrawEmbedUrl,
         trackdrawProjectId: form.trackdrawProjectId,
+        trackImageUrl: form.trackImageUrl,
       };
       const result = selectedId ? await apiPut(`/api/tracks/${selectedId}`, payload) : await apiPost("/api/tracks", payload);
       const id = result.track?.id || selectedId;
@@ -673,6 +678,29 @@ export default function TrackManagementPage() {
       setStatus(`保存失败：${error.message}`);
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function uploadTrackImage(file) {
+    if (!file || !selectedId) return;
+    setUploadingImage(true);
+    setStatus("正在上传赛道图片...");
+    try {
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error("读取图片失败"));
+        reader.readAsDataURL(file);
+      });
+      const result = await apiPost(`/api/tracks/${selectedId}/image`, { dataUrl });
+      setForm((current) => ({ ...current, trackImageUrl: result.trackImageUrl }));
+      setDetail(result.track || detail);
+      setStatus("赛道图片已上传");
+      await loadTracks(selectedId);
+    } catch (error) {
+      setStatus(`图片上传失败：${error.message}`);
+    } finally {
+      setUploadingImage(false);
     }
   }
 
@@ -703,14 +731,13 @@ export default function TrackManagementPage() {
   }
 
   const readiness = trackReadiness(detail);
-  const selectedPlan = useMemo(() => detail?.transportPlans?.find((plan) => plan.selected) || detail?.transportPlans?.[0] || null, [detail]);
 
   return (
     <div style={{ display: "grid", gap: 14 }}>
       <section style={panelStyle}>
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <div>
-            <h2 style={{ margin: 0, color: "#0f172a", fontSize: 24 }}>赛道管理</h2>
+            <h2 style={{ marginTop: 0, color: "#0f172a", fontWeight: 900, textAlign: "left" }}>赛道管理</h2>
             <div style={{ color: status.includes("失败") ? "#b91c1c" : "#64748b", fontSize: 13, marginTop: 5 }}>{status}</div>
           </div>
           <button type="button" style={primaryButtonStyle} onClick={newTrack}>新建赛道</button>
@@ -758,15 +785,16 @@ export default function TrackManagementPage() {
         </div>
       </section>
 
-      <TrackForm value={form} onChange={setForm} onSave={saveTrack} saving={saving} />
+      <TrackForm value={form} onChange={setForm} onSave={saveTrack} saving={saving} onUploadImage={uploadTrackImage} uploadingImage={uploadingImage} />
 
       {detail && (
         <>
           <section style={panelStyle}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
               <div>
-                <h3 style={{ margin: 0, color: "#0f172a" }}>赛道详情</h3>
+                <h2 style={{ marginTop: 0, color: "#0f172a", fontWeight: 900, textAlign: "left" }}>赛道详情</h2>
                 <div style={{ color: "#64748b", fontSize: 13, marginTop: 4 }}>projectId: {detail.trackdrawProjectId || "--"}</div>
+                {detail.trackImageUrl && <div style={{ color: "#64748b", fontSize: 13, marginTop: 4 }}>已上传赛道图片</div>}
               </div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <a href="https://trackdraw.app" target="_blank" rel="noreferrer" style={{ ...buttonStyle, display: "inline-flex", alignItems: "center", textDecoration: "none" }}>打开 TrackDraw</a>
@@ -796,6 +824,7 @@ export default function TrackManagementPage() {
               </div>
             </div>
             {detail.syncError && <div style={{ color: "#b91c1c", fontSize: 13, marginBottom: 10 }}>{detail.syncError}</div>}
+            {detail.trackImageUrl && <img src={detail.trackImageUrl} alt="赛道图片" style={{ width: "100%", maxHeight: 360, objectFit: "contain", border: "1px solid #e5e7eb", borderRadius: 12, background: "#f8fafc", marginBottom: 12 }} />}
             {readiness?.status && readiness.status !== "ready" && (
               <div style={{ border: "1px solid #fed7aa", background: "#fff7ed", color: "#9a3412", borderRadius: 10, padding: 10, marginBottom: 12, fontSize: 13 }}>
                 readiness issues：{(readiness.issues || []).map((item) => item.type).join("、") || "未通过 ready 检查"}
@@ -803,18 +832,12 @@ export default function TrackManagementPage() {
             )}
           </section>
 
-          <EquipmentEditor track={detail} onSaved={() => loadTracks(detail.id)} />
+          <EquipmentEditor key={`${detail.id}-${detail.updatedAt || ""}`} track={detail} onSaved={() => loadTracks(detail.id)} />
 
-          <UnknownObjectEditor track={detail} onSaved={() => loadTracks(detail.id)} />
+          <UnknownObjectEditor key={`${detail.id}-${detail.updatedAt || ""}`} track={detail} onSaved={() => loadTracks(detail.id)} />
 
-          <TransportPlanner track={detail} onSaved={() => loadTracks(detail.id)} />
+          <TransportPlanner key={`${detail.id}-${detail.updatedAt || ""}`} track={detail} onSaved={() => loadTracks(detail.id)} />
 
-          {false && selectedPlan && (
-            <section style={panelStyle}>
-              <h3 style={{ marginTop: 0, color: "#0f172a" }}>当前选中方案</h3>
-              <TransportPlanView planRecord={selectedPlan} />
-            </section>
-          )}
         </>
       )}
     </div>

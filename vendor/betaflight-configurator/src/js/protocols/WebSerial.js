@@ -1,0 +1,659 @@
+import { webSerialDevices, vendorIdNames } from "./devices";
+import GUI from "../gui";
+
+const logHead = "[WEBSERIAL]";
+const trainingSerialClaimKey = "fpv-training-active-serial-port-v1";
+const betaflightSerialClaimKey = "fpv-betaflight-active-serial-port-v1";
+const trainingSerialClaimTtlMs = 5000;
+
+function portDescriptor(port, ports = []) {
+    const info = port?.getInfo?.() || {};
+    const usbVendorId = Number(info.usbVendorId) || 0;
+    const usbProductId = Number(info.usbProductId) || 0;
+    const matchingPorts = ports.filter((candidate) => {
+        const candidateInfo = candidate?.getInfo?.() || {};
+        return (Number(candidateInfo.usbVendorId) || 0) === usbVendorId
+            && (Number(candidateInfo.usbProductId) || 0) === usbProductId;
+    });
+    return {
+        usbVendorId,
+        usbProductId,
+        ordinal: Math.max(0, matchingPorts.indexOf(port)),
+    };
+}
+
+function readTrainingSerialClaim(now = Date.now()) {
+    try {
+        const claim = JSON.parse(window.localStorage.getItem(trainingSerialClaimKey) || "null");
+        if (!claim?.ownerId || now - Number(claim.updatedAt || 0) > trainingSerialClaimTtlMs) return null;
+        return claim;
+    } catch {
+        return null;
+    }
+}
+
+async function isTrainingSerialPort(port, ports = null) {
+    const claim = readTrainingSerialClaim();
+    if (!claim || !port) return false;
+    const authorizedPorts = ports || await navigator.serial.getPorts();
+    const descriptor = portDescriptor(port, authorizedPorts);
+    return descriptor.usbVendorId === Number(claim.usbVendorId)
+        && descriptor.usbProductId === Number(claim.usbProductId)
+        && descriptor.ordinal === Number(claim.ordinal);
+}
+
+async function writeBetaflightSerialClaim(port, ownerId) {
+    if (!port || !ownerId) return;
+    try {
+        const ports = await navigator.serial.getPorts();
+        window.localStorage.setItem(betaflightSerialClaimKey, JSON.stringify({
+            ...portDescriptor(port, ports),
+            ownerId,
+            updatedAt: Date.now(),
+        }));
+    } catch (error) {
+        console.warn(`${logHead} Unable to publish Betaflight serial ownership`, error);
+    }
+}
+
+function releaseBetaflightSerialClaim(ownerId) {
+    try {
+        const claim = JSON.parse(window.localStorage.getItem(betaflightSerialClaimKey) || "null");
+        if (!claim || claim.ownerId === ownerId) window.localStorage.removeItem(betaflightSerialClaimKey);
+    } catch {
+        // Storage may be unavailable in hardened browser profiles.
+    }
+}
+
+async function* streamAsyncIterable(reader, keepReadingFlag) {
+    try {
+        while (keepReadingFlag()) {
+            try {
+                const { done, value } = await reader.read();
+                if (done) {
+                    return;
+                }
+                yield value;
+            } catch (error) {
+                console.warn(`${logHead} Read error in streamAsyncIterable:`, error);
+                break;
+            }
+        }
+    } finally {
+        try {
+            // `locked` belongs to ReadableStream, not its reader. Always try to
+            // release here; a duplicate release is harmless and caught below.
+            reader?.releaseLock();
+        } catch (error) {
+            console.warn(`${logHead} Error releasing reader lock:`, error);
+        }
+    }
+}
+
+/**
+ * WebSerial protocol implementation for the Serial base class
+ */
+class WebSerial extends EventTarget {
+    // Stable id per physical SerialPort object. The browser reuses the same
+    // SerialPort instance across an MCU-reboot USB re-enumeration, so keying the
+    // id off object identity yields an id that survives device-list rebuilds —
+    // unlike a bare counter that would reset every time loadDevices() runs.
+    // WeakMap so entries are collected once the browser drops the SerialPort.
+    #portIds = new WeakMap();
+    #nextPortId = 0;
+
+    constructor() {
+        super();
+
+        this.connected = false;
+        this.openRequested = false;
+        this.openCanceled = false;
+        this.closeRequested = false;
+        this.transmitting = false;
+        this.connectionInfo = null;
+
+        this.bitrate = 0;
+        this.bytesSent = 0;
+        this.bytesReceived = 0;
+        this.failed = 0;
+
+        this.ports = [];
+        this.port = null;
+        this.reader = null;
+        this.writer = null;
+        this.reading = false;
+        this.readLoopPromise = null;
+        this.claimTimer = null;
+        this.claimOwnerId = typeof window.crypto?.randomUUID === "function"
+            ? window.crypto.randomUUID()
+            : `${Date.now()}-${Math.random()}`;
+
+        if (!navigator?.serial) {
+            console.error(`${logHead} Web Serial API not supported`);
+            return;
+        }
+
+        this.connect = this.connect.bind(this);
+        this.disconnect = this.disconnect.bind(this);
+        this.handleDisconnect = this.handleDisconnect.bind(this);
+        this.handleReceiveBytes = this.handleReceiveBytes.bind(this);
+        this.handlePageHide = this.handlePageHide.bind(this);
+
+        // Initialize device connection/disconnection listeners
+        navigator.serial.addEventListener("connect", (e) => this.handleNewDevice(e.target));
+        navigator.serial.addEventListener("disconnect", (e) => this.handleRemovedDevice(e.target));
+        window.addEventListener("pagehide", this.handlePageHide);
+
+        this.isNeedBatchWrite = false;
+        this.loadDevices();
+    }
+
+    handleNewDevice(device) {
+        const added = this.createPort(device);
+        this.ports.push(added);
+        this.dispatchEvent(new CustomEvent("addedDevice", { detail: added }));
+        return added;
+    }
+
+    handleRemovedDevice(device) {
+        const removed = this.ports.find((port) => port.port === device);
+        this.ports = this.ports.filter((port) => port.port !== device);
+        this.dispatchEvent(new CustomEvent("removedDevice", { detail: removed }));
+    }
+
+    handleReceiveBytes(info) {
+        this.bytesReceived += info.detail.byteLength;
+    }
+
+    handleDisconnect() {
+        console.log(`${logHead} Device disconnected externally`);
+        this.disconnect();
+    }
+
+    handlePageHide() {
+        this.stopSerialClaim();
+    }
+
+    async startSerialClaim(port) {
+        this.stopSerialClaim();
+        await writeBetaflightSerialClaim(port, this.claimOwnerId);
+        this.claimTimer = window.setInterval(() => {
+            if (this.connected && this.port === port) {
+                void writeBetaflightSerialClaim(port, this.claimOwnerId);
+            }
+        }, 2000);
+    }
+
+    stopSerialClaim() {
+        if (this.claimTimer !== null) window.clearInterval(this.claimTimer);
+        this.claimTimer = null;
+        releaseBetaflightSerialClaim(this.claimOwnerId);
+    }
+
+    async confirmFlightController() {
+        if (this.connected && this.port) await this.startSerialClaim(this.port);
+    }
+
+    getConnectedDevice() {
+        return this.port;
+    }
+
+    /**
+     * Return the raw W3C SerialPort for a given path, so callers that need direct
+     * port access (e.g. esptool-js for ESP32 flashing) can own open/close and signals.
+     * @param {string} path - port path (e.g. "serial")
+     * @returns {SerialPort|undefined}
+     */
+    getNativePort(path) {
+        return this.ports.find((device) => device.path === path)?.port;
+    }
+
+    /**
+     * Return the stable id for a SerialPort object, minting one on first sighting
+     * and reusing it for the same object thereafter. The same reused SerialPort
+     * across a re-enumeration therefore always maps to the same path.
+     * @param {SerialPort} port
+     * @returns {string} stable id, e.g. "serial_0"
+     */
+    #getStablePortId(port) {
+        let id = this.#portIds.get(port);
+        if (id === undefined) {
+            id = `serial_${this.#nextPortId++}`;
+            this.#portIds.set(port, id);
+        }
+        return id;
+    }
+
+    createPort(port) {
+        const portInfo = port.getInfo();
+        const displayName = vendorIdNames[portInfo.usbVendorId]
+            ? vendorIdNames[portInfo.usbVendorId]
+            : `VID:${portInfo.usbVendorId} PID:${portInfo.usbProductId}`;
+        return {
+            path: this.#getStablePortId(port),
+            displayName: `Betaflight ${displayName}`,
+            vendorId: portInfo.usbVendorId,
+            productId: portInfo.usbProductId,
+            port: port,
+        };
+    }
+
+    async loadDevices() {
+        try {
+            const ports = await navigator.serial.getPorts();
+            const availablePorts = [];
+            for (const port of ports) {
+                if (!await isTrainingSerialPort(port, ports)) availablePorts.push(port);
+            }
+            this.ports = availablePorts.map((port) => this.createPort(port));
+        } catch (error) {
+            console.error(`${logHead} Error loading devices:`, error);
+        }
+    }
+
+    async requestPermissionDevice(showAllSerialDevices = false) {
+        let newPermissionPort = null;
+
+        try {
+            const options = showAllSerialDevices ? {} : { filters: webSerialDevices };
+            const userSelectedPort = await navigator.serial.requestPort(options);
+
+            if (await isTrainingSerialPort(userSelectedPort)) {
+                console.error(`${logHead} Refusing to open the active training receiver array`);
+                return null;
+            }
+
+            newPermissionPort = this.ports.find((port) => port.port === userSelectedPort);
+
+            if (!newPermissionPort) {
+                newPermissionPort = this.handleNewDevice(userSelectedPort);
+            }
+            console.info(`${logHead} User selected SERIAL device from permissions:`, newPermissionPort.path);
+        } catch (error) {
+            console.error(`${logHead} User didn't select any SERIAL device when requesting permission:`, error);
+        }
+        return newPermissionPort;
+    }
+
+    async getDevices() {
+        await this.loadDevices();
+        return this.ports;
+    }
+
+    async connect(path, options = { baudRate: 115200 }) {
+        // Prevent double connections
+        if (this.connected) {
+            console.log(`${logHead} Already connected, not connecting again`);
+            return true;
+        }
+
+        this.openRequested = true;
+        this.closeRequested = false;
+
+        try {
+            const device = this.ports.find((device) => device.path === path);
+            if (!device) {
+                console.error(`${logHead} Device not found:`, path);
+                this.openRequested = false;
+                this.dispatchEvent(new CustomEvent("connect", { detail: false }));
+                return false;
+            }
+
+            this.port = device.port;
+
+            if (await isTrainingSerialPort(this.port)) {
+                console.error(`${logHead} Refusing to open the active training receiver array`);
+                this.port = null;
+                this.openRequested = false;
+                this.dispatchEvent(new CustomEvent("connect", { detail: false }));
+                return false;
+            }
+
+            await this.port.open(options);
+
+            const connectionInfo = this.port.getInfo();
+            this.connectionInfo = connectionInfo;
+            this.isNeedBatchWrite = this.checkIsNeedBatchWrite();
+            if (this.isNeedBatchWrite) {
+                console.log(`${logHead} Enabling batch write mode for AT32 on macOS`);
+            }
+            this.writer = this.port.writable.getWriter();
+            this.reader = this.port.readable.getReader();
+
+            if (connectionInfo && !this.openCanceled) {
+                this.connected = true;
+                this.connectionId = path;
+                this.bitrate = options.baudRate;
+                this.bytesReceived = 0;
+                this.bytesSent = 0;
+                this.failed = 0;
+                this.openRequested = false;
+                this.port.addEventListener("disconnect", this.handleDisconnect);
+                this.addEventListener("receive", this.handleReceiveBytes);
+
+                console.log(`${logHead} Connection opened with ID: ${this.connectionId}, Baud: ${options.baudRate}`);
+
+                this.dispatchEvent(new CustomEvent("connect", { detail: connectionInfo }));
+
+                // Start reading from the port
+                this.reading = true;
+                const readLoopPromise = this.readLoop();
+                this.readLoopPromise = readLoopPromise;
+                void readLoopPromise.finally(() => {
+                    if (this.readLoopPromise === readLoopPromise) this.readLoopPromise = null;
+                });
+
+                return true;
+            } else if (connectionInfo && this.openCanceled) {
+                this.connectionId = path;
+
+                console.log(`${logHead} Connection opened with ID: ${path}, but request was canceled, disconnecting`);
+                // some bluetooth dongles/dongle drivers really doesn't like to be closed instantly, adding a small delay
+                setTimeout(() => {
+                    this.openRequested = false;
+                    this.openCanceled = false;
+                    this.disconnect();
+                    this.dispatchEvent(new CustomEvent("connect", { detail: false }));
+                }, 150);
+
+                return false;
+            } else {
+                this.openRequested = false;
+                console.log(`${logHead} Failed to open serial port`);
+                this.dispatchEvent(new CustomEvent("connect", { detail: false }));
+                return false;
+            }
+        } catch (error) {
+            console.error(`${logHead} Error connecting:`, error);
+            await this.cleanupFailedConnection();
+            this.dispatchEvent(new CustomEvent("connect", { detail: false }));
+            return false;
+        }
+    }
+
+    async cleanupFailedConnection() {
+        this.stopSerialClaim();
+        this.connected = false;
+        this.openRequested = false;
+        this.openCanceled = false;
+        this.reading = false;
+        this.transmitting = false;
+
+        const reader = this.reader;
+        const writer = this.writer;
+        const port = this.port;
+        this.reader = null;
+        this.writer = null;
+        this.port = null;
+
+        if (reader) {
+            try {
+                await reader.cancel();
+            } catch (error) {
+                console.warn(`${logHead} Failed-connect reader cancel error:`, error);
+            }
+            try {
+                reader.releaseLock();
+            } catch (error) {
+                console.warn(`${logHead} Failed-connect reader release error:`, error);
+            }
+        }
+        if (writer) {
+            try {
+                writer.releaseLock();
+            } catch (error) {
+                console.warn(`${logHead} Failed-connect writer release error:`, error);
+            }
+        }
+        if (port && (reader || writer || port.readable || port.writable)) {
+            try {
+                await port.close();
+            } catch (error) {
+                console.warn(`${logHead} Failed-connect port close error:`, error);
+            }
+        }
+
+        this.connectionId = false;
+        this.bitrate = 0;
+        this.connectionInfo = null;
+        this.closeRequested = false;
+    }
+
+    async readLoop() {
+        try {
+            for await (let value of streamAsyncIterable(this.reader, () => this.reading)) {
+                this.dispatchEvent(new CustomEvent("receive", { detail: value }));
+            }
+        } catch (error) {
+            console.error(`${logHead} Error reading:`, error);
+            if (this.connected) {
+                // Let this read task settle before disconnect waits for it.
+                queueMicrotask(() => void this.disconnect());
+            }
+        }
+    }
+
+    // Update disconnect method
+    async disconnect() {
+        // A failed/cancelled open can leave partially-created stream handles.
+        if (!this.connected && !this.port && !this.reader && !this.writer) {
+            return true;
+        }
+
+        // Mark as disconnected immediately to prevent race conditions
+        this.stopSerialClaim();
+        this.connected = false;
+        this.transmitting = false;
+
+        // Signal the read loop to stop BEFORE attempting cleanup
+        this.reading = false;
+
+        // If already closing, don't do it again
+        if (this.closeRequested) {
+            return true;
+        }
+
+        this.closeRequested = true;
+
+        try {
+            // Remove event listeners first
+            this.removeEventListener("receive", this.handleReceiveBytes);
+
+            // Small delay to allow ongoing operations to notice connection state change
+            await new Promise((resolve) => setTimeout(resolve, 50));
+
+            // Cancel reader first if it exists - this doesn't release the lock
+            const reader = this.reader;
+            if (reader) {
+                try {
+                    await reader.cancel();
+                } catch (e) {
+                    console.warn(`${logHead} Reader cancel error (can be ignored):`, e);
+                }
+            }
+
+            if (this.readLoopPromise) {
+                try {
+                    await this.readLoopPromise;
+                } catch (e) {
+                    console.warn(`${logHead} Read loop shutdown error (can be ignored):`, e);
+                }
+                this.readLoopPromise = null;
+            }
+
+            // The iterator normally releases this lock. The cancelled-open path
+            // never starts an iterator, so make a final best-effort release too.
+            if (reader) {
+                try {
+                    reader.releaseLock();
+                } catch (e) {
+                    console.warn(`${logHead} Reader release error (can be ignored):`, e);
+                }
+            }
+            this.reader = null;
+
+            // Release writer lock if it exists
+            if (this.writer) {
+                try {
+                    this.writer.releaseLock();
+                } catch (e) {
+                    console.warn(`${logHead} Writer release error (can be ignored):`, e);
+                }
+                this.writer = null;
+            }
+
+            // Close the port
+            if (this.port) {
+                this.port.removeEventListener("disconnect", this.handleDisconnect);
+                try {
+                    await this.port.close();
+                } catch (e) {
+                    console.warn(`${logHead} Port already closed or error during close:`, e);
+                }
+                this.port = null;
+            }
+
+            console.log(
+                `${logHead} Connection with ID: ${this.connectionId} closed, Sent: ${this.bytesSent} bytes, Received: ${this.bytesReceived} bytes`,
+            );
+
+            this.connectionId = false;
+            this.bitrate = 0;
+            this.connectionInfo = null; // Reset connectionInfo
+            this.closeRequested = false;
+
+            this.dispatchEvent(new CustomEvent("disconnect", { detail: true }));
+            return true;
+        } catch (error) {
+            console.error(`${logHead} Error disconnecting:`, error);
+            this.closeRequested = false;
+            // Ensure connectionInfo is reset even on error if port was potentially open
+            this.connectionInfo = null;
+            this.dispatchEvent(new CustomEvent("disconnect", { detail: false }));
+            return false;
+        } finally {
+            if (this.openCanceled) {
+                this.openCanceled = false;
+            }
+        }
+    }
+
+    forceClose() {
+        // Best-effort teardown for page-unload (pagehide / beforeunload).
+        // Instance refs are nulled immediately so the rest of the class sees a
+        // disconnected state; the actual async teardown runs in a Promise chain
+        // that Chrome typically drains before destroying the JS context.
+        if (!this.port && !this.reader && !this.writer) {
+            return;
+        }
+
+        this.connected = false;
+        this.transmitting = false;
+        this.reading = false;
+
+        this.removeEventListener("receive", this.handleReceiveBytes);
+
+        const reader = this.reader;
+        const writer = this.writer;
+        const port = this.port;
+        this.reader = null;
+        this.writer = null;
+        this.port = null;
+
+        if (port) {
+            port.removeEventListener("disconnect", this.handleDisconnect);
+        }
+
+        // Mirrors the disconnect() sequence but without awaiting at call-site.
+        (async () => {
+            // 1. Cancel reader — resolves the pending read in streamAsyncIterable,
+            //    whose finally block will call releaseLock() on the readable side.
+            if (reader) {
+                try {
+                    await reader.cancel();
+                } catch (error) {
+                    console.debug(`${logHead} forceClose: reader.cancel() failed during unload`, error);
+                }
+            }
+
+            if (writer) {
+                try {
+                    writer.releaseLock();
+                } catch (error) {
+                    console.debug(`${logHead} forceClose: writer.releaseLock() failed during unload`, error);
+                }
+            }
+
+            // Close port — Chrome allows this after reader.cancel() even if the
+            // reader lock is still technically held (streamAsyncIterable cleans up).
+            if (port) {
+                try {
+                    await port.close();
+                } catch (error) {
+                    console.debug(`${logHead} forceClose: port.close() failed during unload`, error);
+                }
+            }
+        })();
+
+        this.closeRequested = false;
+        this.connectionInfo = null;
+        this.connectionId = false;
+    }
+
+    checkIsNeedBatchWrite() {
+        const isMac = GUI.operating_system === "MacOS";
+        return isMac && vendorIdNames[this.connectionInfo.usbVendorId] === "AT32";
+    }
+
+    async batchWrite(data) {
+        // AT32 on macOS requires smaller chunks (63 bytes) to work correctly due to
+        // USB buffer size limitations in the macOS implementation
+        const batchWriteSize = 63;
+        let remainingData = data;
+        while (remainingData.byteLength > batchWriteSize) {
+            const sliceData = remainingData.slice(0, batchWriteSize);
+            remainingData = remainingData.slice(batchWriteSize);
+            try {
+                await this.writer.write(sliceData);
+            } catch (error) {
+                console.error(`${logHead} Error writing batch chunk:`, error);
+                throw error; // Re-throw to be caught by the send method
+            }
+        }
+        await this.writer.write(remainingData);
+    }
+
+    async send(data, callback) {
+        if (!this.connected || !this.writer) {
+            console.error(`${logHead} Failed to send data, serial port not open`);
+            if (callback) {
+                callback({ bytesSent: 0 });
+            }
+            return { bytesSent: 0 };
+        }
+
+        try {
+            if (this.isNeedBatchWrite) {
+                await this.batchWrite(data);
+            } else {
+                await this.writer.write(data);
+            }
+            this.bytesSent += data.byteLength;
+
+            const result = { bytesSent: data.byteLength };
+            if (callback) {
+                callback(result);
+            }
+            return result;
+        } catch (error) {
+            console.error(`${logHead} Error sending data:`, error);
+            if (callback) {
+                callback({ bytesSent: 0 });
+            }
+            return { bytesSent: 0 };
+        }
+    }
+}
+
+// Export the class itself, not an instance
+export default WebSerial;

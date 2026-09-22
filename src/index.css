@@ -54,6 +54,219 @@ body {
   margin: 0;
 }
 
+@keyframes live-status-breathe {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, .3), 0 4px 12px rgba(127, 29, 29, .24); }
+  50% { box-shadow: 0 0 0 5px rgba(255, 255, 255, 0), 0 7px 18px rgba(127, 29, 29, .38); }
+}
+
+.live-status-badge {
+  position: absolute;
+  top: 7px;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border: 1px solid rgba(255, 255, 255, .65);
+  border-radius: 999px;
+  background: rgba(235, 70, 70, 0.94);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 950;
+  line-height: 1;
+  letter-spacing: .03em;
+  pointer-events: none;
+  animation: live-status-breathe 1.6s ease-in-out infinite;
+}
+
+.live-status-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.live-jump-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border-color: #ef4444 !important;
+  background: #fff !important;
+  color: #b91c1c !important;
+  animation: live-status-breathe 1.6s ease-in-out infinite;
+}
+
+.live-jump-button .live-status-dot {
+  background: #ef4444;
+}
+
+.tournament-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.tournament-header-title {
+  flex: 1 1 100%;
+  min-width: 0;
+  text-align: center;
+}
+
+.tournament-header-settings {
+  flex: 0 1 auto;
+  min-width: 0;
+  text-align: center;
+}
+
+.tournament-match-count {
+  margin-right: auto;
+  color: #1d4ed8;
+  font-size: 13px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.tournament-format-controls {
+  justify-content: center;
+}
+
+.tournament-header-actions {
+  margin-left: auto;
+  justify-content: center;
+  min-width: 0;
+}
+
+.race-control-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 14px;
+}
+
+.race-control-match-title {
+  min-width: 0;
+}
+
+.race-control-timer {
+  min-width: 140px;
+  text-align: center;
+}
+
+.race-control-actions {
+  display: flex;
+  justify-self: end;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 900px) {
+  .tournament-page {
+    box-sizing: border-box;
+    max-width: 100%;
+    overflow-x: hidden;
+    padding: clamp(10px, 3.5vw, 22px) !important;
+  }
+
+  .tournament-header {
+    gap: 14px;
+    padding: clamp(14px, 4vw, 20px) !important;
+  }
+
+  .tournament-header-title {
+    text-align: center;
+  }
+
+  .tournament-header h1 {
+    font-size: clamp(22px, 7vw, 30px) !important;
+    line-height: 1.2;
+  }
+
+  .tournament-header-settings,
+  .tournament-header-actions,
+  .tournament-match-count {
+    box-sizing: border-box;
+  }
+
+  .tournament-match-count {
+    width: 100%;
+    margin-right: 0;
+    text-align: center;
+  }
+
+  .tournament-format-controls {
+    display: grid !important;
+    grid-template-columns: max-content minmax(0, 1fr);
+    justify-content: stretch !important;
+  }
+
+  .tournament-format-controls select {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .tournament-header-actions {
+    margin-left: 0;
+    justify-content: center !important;
+  }
+
+  .race-control-header {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: center;
+  }
+
+  .race-control-match-title,
+  .race-control-actions {
+    justify-self: center;
+    text-align: center;
+  }
+
+  .race-control-actions {
+    justify-content: center;
+  }
+}
+
+@media (max-width: 420px) {
+  .live-status-badge {
+    top: 6px;
+    right: 6px;
+    padding-inline: 5px;
+    font-size: 8px;
+  }
+}
+
+@keyframes bracket-current-breathe {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(249, 115, 22, .18), 0 8px 18px rgba(15, 23, 42, .08); }
+  50% { box-shadow: 0 0 0 9px rgba(249, 115, 22, .08), 0 12px 28px rgba(249, 115, 22, .2); }
+}
+
+.bracket-match-current {
+  animation: bracket-current-breathe 1.8s ease-in-out infinite;
+}
+
+.bracket-scroll-viewport::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+.bracket-scroll-viewport > div > div {
+  backface-visibility: hidden;
+  transform-style: preserve-3d;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bracket-match-current,
+  .live-status-badge,
+  .live-jump-button { animation: none; }
+}
+
 #root {
   width: 1126px;
   max-width: 100%;

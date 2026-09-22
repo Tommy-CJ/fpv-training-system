@@ -1,17 +1,29 @@
 {
-  "name": "bracket-demo",
+  "name": "fpv-training-system",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "start": "node server.js",
+    "dev": "node scripts/dev.js",
+    "dev:vite": "vite",
+    "server": "node server.js",
     "build": "vite build",
     "lint": "eslint .",
+    "verify:bracket-core": "node scripts/verify-bracket-core.mjs",
+    "verify:training-live": "node scripts/verify-training-live.mjs",
+    "verify:live-load": "node scripts/benchmark-live-ingest.mjs 16 4000",
+    "verify:virtual-receiver": "node scripts/verify-virtual-receiver.mjs",
+    "verify:serial-port-claim": "node scripts/verify-serial-port-claim.mjs",
+    "verify:serial-json-stream": "node scripts/verify-serial-json-stream.mjs",
+    "virtual:receiver": "node scripts/virtual-receiver-array.mjs",
+    "verify:ground-station": "node scripts/verify-ground-station-schema.mjs && node scripts/verify-ground-station-presets.mjs && node scripts/verify-ground-station-fleet.mjs && node scripts/verify-ground-station-states.mjs && node scripts/verify-ground-station-semantics.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
     "better-sqlite3": "^12.9.0",
     "express": "^5.2.1",
+    "jose": "^6.2.3",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"
   },

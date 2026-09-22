@@ -1,4 +1,5 @@
 ﻿import { useCallback, useEffect, useRef, useState } from "react";
+import SkillTreePage from "./pages/SkillTreePage.jsx";
 import PilotLibraryPage from "./pages/PilotLibraryPage.jsx";
 import EventPage from "./pages/EventPage.jsx";
 import MonitorPage from "./pages/MonitorPage.jsx";
@@ -6,6 +7,16 @@ import CoachPage from "./pages/CoachPage.jsx";
 import HistoryPage from "./pages/HistoryPage.jsx";
 import TrackManagementPage from "./pages/TrackManagementPage.jsx";
 import { apiGet, apiPost, buttonStyle, defaultChannelConfig, isValueInRanges, panelStyle, primaryButtonStyle } from "./trainingShared.js";
+import { cacheLivePacket, deleteCachedLivePacket, listCachedLivePackets } from "./liveOutbox.js";
+import { buildPersistenceSerialSnapshot, isHistoricalRecoveryRecord, shouldSendCurrentPersistence } from "./livePersistence.js";
+import { consumeSerialJsonStream } from "./serialJsonStream.js";
+import {
+  claimTrainingSerialPort,
+  findPreferredTrainingSerialPort,
+  isBetaflightSerialPortClaimed,
+  releaseTrainingSerialPortClaim,
+  rememberTrainingSerialPort,
+} from "./serialPortClaim.js";
 
 function makePilot(index) {
   return {
@@ -112,35 +123,87 @@ function stripLocalSerialTelemetry(packet) {
   return compactSerialItem(packet);
 }
 
-function parseSerialLine(line) {
-  const candidates = [line];
-  const firstBrace = line.indexOf("{");
-  const lastBrace = line.lastIndexOf("}");
-  if (firstBrace >= 0 && lastBrace > firstBrace) {
-    candidates.push(line.slice(firstBrace, lastBrace + 1));
+function appendLiveBand(bands, band) {
+  const start = Number(band?.start);
+  const end = Number(band?.end);
+  const state = band?.state;
+  if (!state || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+  const previous = bands[bands.length - 1];
+  if (previous && previous.state === state && start - previous.end <= 1000) {
+    previous.end = Math.max(previous.end, end);
+    return;
   }
+  bands.push({ ...band, start, end });
+}
 
-  const rxIndex = line.indexOf('"rx"');
-  if (rxIndex >= 0) {
-    const tail = line.slice(rxIndex).replace(/^[,{]+/, "");
-    const body = tail.endsWith("}") ? tail : `${tail}}`;
-    candidates.push(`{${body}`);
+function mergeLiveBandUpdates(existingBands = [], updates = []) {
+  const sortedUpdates = updates
+    .filter((band) => Number(band?.end) > Number(band?.start))
+    .sort((left, right) => Number(left.start) - Number(right.start));
+  if (!sortedUpdates.length) return existingBands;
+  const replaceFrom = Number(sortedUpdates[0].start);
+  const merged = [];
+  for (const band of existingBands) {
+    const start = Number(band?.start);
+    const end = Number(band?.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+    if (end <= replaceFrom) appendLiveBand(merged, band);
+    else if (start < replaceFrom) appendLiveBand(merged, { ...band, end: replaceFrom });
   }
+  for (const band of sortedUpdates) appendLiveBand(merged, band);
+  return merged;
+}
 
-  for (const candidate of candidates) {
-    try {
-      return { packet: JSON.parse(candidate), line: candidate };
-    } catch {
-      // Try the next recovery candidate.
-    }
+function mergeLiveBandMaps(existingByPilot = {}, updatesByPilot = {}) {
+  const merged = { ...existingByPilot };
+  for (const [pilotId, updates] of Object.entries(updatesByPilot || {})) {
+    if (!updates?.length) continue;
+    merged[pilotId] = mergeLiveBandUpdates(merged[pilotId] || [], updates);
   }
-  return null;
+  return merged;
 }
 
 const LIVE_ROOM_ID = "default";
+// CORE DATA-PLANE INVARIANTS (see docs/LIVE_DATA_PIPELINE.md):
+// - Online transport is one 30 Hz stream; selected ~5 Hz frames are upgraded
+//   in-place with durable metadata after IndexedDB commits.
+// - Never delete a durable record before the server ACK and local delete both
+//   complete. Historical replay is persistOnly and must never drive live UI.
+// - Recovery work is lower priority than current live/current durable frames.
 const RECEIVER_ONLINE_WINDOW_MS = 900;
+const SERIAL_SAMPLE_BUFFER_MS = 10000;
+const SERIAL_SAMPLE_BUFFER_LIMIT = 600;
 const TRAINING_HUB_VENDOR_ID = 0x0483;
 const TRAINING_HUB_PRODUCT_ID = 0x5740;
+const LIVE_SESSION_STORAGE_KEY = "fpv-training-live-session";
+const LIVE_SEQUENCE_STORAGE_KEY = "fpv-training-live-sequence";
+const PERSISTENCE_SAMPLE_INTERVAL_MS = 200;
+const OUTBOX_MAX_IN_FLIGHT = 16;
+const OUTBOX_REPLAY_BATCH_SIZE = 3;
+const OUTBOX_REPLAY_INTERVAL_MS = 200;
+const OUTBOX_REPLAY_MIN_INTERVAL_MS = 180;
+const OUTBOX_ACK_TIMEOUT_MS = 3000;
+
+function loadLiveSessionId() {
+  try {
+    let value = window.sessionStorage.getItem(LIVE_SESSION_STORAGE_KEY);
+    if (!value) {
+      value = typeof window.crypto?.randomUUID === "function" ? window.crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      window.sessionStorage.setItem(LIVE_SESSION_STORAGE_KEY, value);
+    }
+    return value;
+  } catch {
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+}
+
+function loadLiveSequence() {
+  try {
+    return Math.max(0, Number(window.localStorage.getItem(LIVE_SEQUENCE_STORAGE_KEY)) || 0);
+  } catch {
+    return 0;
+  }
+}
 
 function getLiveSocketUrl() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -160,7 +223,7 @@ function formatSerialPortName(port) {
     const label = isTrainingHubPort(port) ? "TRAINING_HUB" : "USB";
     return `${label} ${vendorId}:${productId}`;
   }
-  return "Selected serial port";
+  return "Virtual / selected serial port";
 }
 
 function sameEvents(left = [], right = []) {
@@ -291,6 +354,31 @@ function formatBytes(value) {
   return `${bytes} B`;
 }
 
+function formatBitRate(value) {
+  const bitsPerSecond = Number(value) || 0;
+  if (bitsPerSecond >= 1_000_000) return `${(bitsPerSecond / 1_000_000).toFixed(2)} Mbps`;
+  if (bitsPerSecond >= 1000) return `${(bitsPerSecond / 1000).toFixed(0)} Kbps`;
+  return `${Math.round(bitsPerSecond)} bps`;
+}
+
+function formatHistoryLag(value) {
+  const seconds = Math.max(0, Math.round((Number(value) || 0) / 1000));
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes} 分 ${seconds % 60} 秒`;
+}
+
+function audiencePressureText(level) {
+  return ({ low: "低", medium: "中", high: "高", critical: "已满载" })[level] || "低";
+}
+
+function audiencePressureColor(level) {
+  if (level === "critical") return "#b91c1c";
+  if (level === "high") return "#c2410c";
+  if (level === "medium") return "#a16207";
+  return "#047857";
+}
+
 function isChineseVoice(voice) {
   const lang = String(voice?.lang || "").toLowerCase();
   const name = String(voice?.name || "");
@@ -306,7 +394,7 @@ function isPreferredChineseVoice(voice) {
   return /晓晓|Xiaoxiao/i.test(text) && /Online|Natural|Neural/i.test(text);
 }
 
-export default function TrainingSystem({ onBack, onOpenBracket, audience = false, initialTab = "pilots" }) {
+export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = false, audience = false, initialTab = "pilots" }) {
   const [tab, setTab] = useState(initialTab);
   const [pilots, setPilots] = useState([]);
   const [events, setEvents] = useState([]);
@@ -332,17 +420,37 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
   const serialConnectInFlightRef = useRef(false);
   const manualSerialDisconnectRef = useRef(false);
   const serialReconnectTimerRef = useRef(0);
+  const serialClaimTimerRef = useRef(0);
+  const serialClaimOwnerRef = useRef(typeof window.crypto?.randomUUID === "function" ? window.crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
   const serialLatestRef = useRef({});
+  const serialSamplesRef = useRef({});
   const announcerRuntimeRef = useRef({ pilots: new Map(), receivers: new Map(), cooldowns: new Map(), eventId: "" });
   const serialRenderFrameRef = useRef(0);
   const serialInputFpsRef = useRef({ count: 0, startedAt: 0 });
   const liveSocketRef = useRef(null);
   const liveRelayRef = useRef({ lastSentAt: 0, lastUiAt: 0, minIntervalMs: 30 });
+  const eventsRef = useRef([]);
+  const liveSessionIdRef = useRef(loadLiveSessionId());
+  const liveClientSequenceRef = useRef(loadLiveSequence());
+  const audienceSequenceRef = useRef(0);
+  const audienceStreamIdRef = useRef("");
+  const outboxInFlightRef = useRef(new Map());
+  const outboxFlushTimerRef = useRef(0);
+  const outboxWriteChainRef = useRef(Promise.resolve());
+  const outboxRecoveryWriteFenceRef = useRef(Promise.resolve());
+  const outboxRecoveringRef = useRef(false);
+  const outboxRecoveryCutoffSequenceRef = useRef(0);
+  const outboxRecoveryCutoffCapturedAtRef = useRef(0);
+  const outboxRecoveryHadRecordsRef = useRef(false);
+  const outboxEmptyPassesRef = useRef(0);
+  const outboxBackfillAtByEventRef = useRef(new Map());
+  const persistenceSampleRef = useRef({ eventId: "", capturedAt: 0 });
   const serialStateRef = useRef(null);
   const serialStateUiRef = useRef({ lastAt: 0, receiverCount: 0, maxReceiverId: 0, connected: false });
   const [serialRenderTick, setSerialRenderTick] = useState(0);
   const [serialInputFps, setSerialInputFps] = useState(0);
   const [liveStateSeed, setLiveStateSeed] = useState(null);
+  const [liveSyncVersion, setLiveSyncVersion] = useState(0);
   const [liveRelayState, setLiveRelayState] = useState({
     connected: false,
     mode: audience ? "subscriber" : "publisher",
@@ -350,6 +458,10 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
     lastAt: null,
     error: "",
     power: null,
+    outboxRecovering: false,
+    outboxPending: 0,
+    outboxPendingMore: false,
+    outboxError: "",
   });
   const [serialState, setSerialState] = useState({
     supported: typeof navigator !== "undefined" && Boolean(navigator.serial),
@@ -370,9 +482,31 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
     serialStateRef.current = serialState;
   }, [serialState]);
 
+  useEffect(() => {
+    eventsRef.current = events;
+  }, [events]);
+
   function pushStatus(message) {
     setStatus(message);
     setStatusLog((current) => [{ time: Date.now(), message }, ...current].slice(0, 80));
+  }
+
+  function stopTrainingSerialClaim() {
+    if (serialClaimTimerRef.current) window.clearInterval(serialClaimTimerRef.current);
+    serialClaimTimerRef.current = 0;
+    releaseTrainingSerialPortClaim(serialClaimOwnerRef.current);
+  }
+
+  function startTrainingSerialClaim(port) {
+    stopTrainingSerialClaim();
+    void claimTrainingSerialPort(port, serialClaimOwnerRef.current);
+    serialClaimTimerRef.current = window.setInterval(() => {
+      if (portRef.current === port && serialStateRef.current?.connected) {
+        void claimTrainingSerialPort(port, serialClaimOwnerRef.current);
+      } else {
+        stopTrainingSerialClaim();
+      }
+    }, 1000);
   }
 
   useEffect(() => {
@@ -430,7 +564,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
 
     let stopped = false;
     async function loadAnnouncerStatsSeed() {
-      const overview = await apiGet(`/api/training-events/${activeEventId}/stats`, { stats: [] });
+      const overview = await apiGet(`/api/training-events/${activeEventId}/stats?includeSegments=0`, { stats: [] });
       if (stopped) return;
       const statsByPilot = {};
       for (const stat of overview?.stats || []) {
@@ -802,6 +936,23 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
       if (!lastDataAt || Date.now() - lastDataAt > 1500) {
         setSerialInputFps(0);
         serialInputFpsRef.current = { count: 0, startedAt: 0 };
+        if (serialStateRef.current?.portName === "虚拟测试阵列" && lastDataAt) {
+          serialLatestRef.current = {};
+          serialSamplesRef.current = {};
+          setSerialState((current) => ({
+            ...current,
+            connected: false,
+            connecting: false,
+            portName: "",
+            receiverCount: 0,
+            maxReceiverId: 0,
+            lastDataAt: null,
+            lastReceiverId: null,
+            lastLine: "",
+            error: "",
+            power: null,
+          }));
+        }
       }
     }, 500);
     return () => window.clearInterval(timer);
@@ -834,11 +985,12 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
     };
   }, []);
 
-  function clearSerialConnection(error = "") {
+  function clearSerialConnection(error = "", { preserveSamples = false } = {}) {
     serialLoopRef.current = false;
     portRef.current = null;
     readerRef.current = null;
     serialLatestRef.current = {};
+    if (!preserveSamples) serialSamplesRef.current = {};
     requestSerialRender();
     setSerialState((current) => ({
       ...current,
@@ -856,8 +1008,9 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
     if (error) pushStatus(error);
   }
 
-  async function releaseSerialResources({ clear = true, error = "" } = {}) {
+  async function releaseSerialResources({ clear = true, error = "", preserveSamples = false } = {}) {
     serialLoopRef.current = false;
+    stopTrainingSerialClaim();
     const reader = readerRef.current;
     const port = portRef.current;
     readerRef.current = null;
@@ -879,7 +1032,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
       // port may already be closed or disconnected
     }
 
-    if (clear) clearSerialConnection(error);
+    if (clear) clearSerialConnection(error, { preserveSamples });
   }
 
   async function openSerialPort(port, { requested = false } = {}) {
@@ -896,12 +1049,17 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
     }));
 
     try {
+      if (await isBetaflightSerialPortClaimed(port)) {
+        throw new Error("该串口正在被内置 BF 使用，请在 BF 断开后重试");
+      }
       if (portRef.current && portRef.current !== port) {
         await releaseSerialResources({ clear: false });
       }
       await port.open({ baudRate: 115200 });
       manualSerialDisconnectRef.current = false;
       portRef.current = port;
+      startTrainingSerialClaim(port);
+      void rememberTrainingSerialPort(port);
       serialLatestRef.current = {};
       requestSerialRender();
       setSerialState((current) => ({
@@ -941,7 +1099,21 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
     if (audience || !navigator.serial || manualSerialDisconnectRef.current || portRef.current) return;
     try {
       const ports = await navigator.serial.getPorts();
-      const port = ports.find(isTrainingHubPort);
+      const candidates = [];
+      for (const port of ports) {
+        if (isTrainingHubPort(port) && !await isBetaflightSerialPortClaimed(port)) candidates.push(port);
+      }
+      const preferred = findPreferredTrainingSerialPort(ports);
+      const port = (preferred && candidates.includes(preferred))
+        ? preferred
+        : (candidates.length === 1 ? candidates[0] : null);
+      if (!port && candidates.length > 1) {
+        setSerialState((current) => ({
+          ...current,
+          error: "检测到多个相同型号串口，请点“连接阵列”并在浏览器中选择 TRAINING_HUB",
+        }));
+        return;
+      }
       if (port) await openSerialPort(port);
     } catch (error) {
       setSerialState((current) => ({ ...current, error: `Serial auto-connect failed: ${error.message}` }));
@@ -963,8 +1135,12 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
     setEvents(nextEvents);
     try {
       await apiPost("/api/events", nextEvents);
-      publishTrainingState(nextEvents);
+      const refreshedEvents = await apiGet("/api/events", nextEvents);
+      const resolvedEvents = Array.isArray(refreshedEvents) ? refreshedEvents : nextEvents;
+      setEvents(resolvedEvents);
+      publishTrainingState(resolvedEvents);
       pushStatus("训练事件已保存");
+      return resolvedEvents;
     } catch (error) {
       pushStatus(`训练事件保存失败：${error.message}`);
       throw error;
@@ -991,11 +1167,19 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
       if (power) setSerialState((current) => ({ ...current, power }));
       return [];
     }
-    recordSerialInputFrame(receivedAt);
+    // FPS describes frames actually arriving at this page. The sample timestamp
+    // remains authoritative for strips, but it may be old during recovery or
+    // differ from the audience device clock.
+    recordSerialInputFrame();
 
     const latest = { ...serialLatestRef.current };
     for (const sample of updatedSamples) {
       latest[sample.receiverId] = sample;
+      const queue = serialSamplesRef.current[sample.receiverId] || [];
+      queue.push(sample);
+      const cutoff = sample.time - SERIAL_SAMPLE_BUFFER_MS;
+      while (queue.length && (queue[0].time < cutoff || queue.length > SERIAL_SAMPLE_BUFFER_LIMIT)) queue.shift();
+      serialSamplesRef.current[sample.receiverId] = queue;
     }
 
     serialLatestRef.current = latest;
@@ -1029,24 +1213,247 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
     return updatedSamples;
   }, [requestSerialRender]);
 
-  const publishLivePacket = useCallback((packet) => {
+  const scheduleOutboxFlush = useCallback((delayMs = 0) => {
     if (audience) return;
-    const socket = liveSocketRef.current;
-    if (!socket || socket.readyState !== 1) return;
+    if (outboxFlushTimerRef.current) window.clearTimeout(outboxFlushTimerRef.current);
+    outboxFlushTimerRef.current = window.setTimeout(async () => {
+      outboxFlushTimerRef.current = 0;
+      const socket = liveSocketRef.current;
+      const socketReady = Boolean(socket && socket.readyState === 1);
+      try {
+        // Freeze recovery only after every write that was already scheduled at
+        // reconnect time has committed. Without this fence, a fast first scan
+        // can declare the outbox empty just before its final offline records
+        // appear in IndexedDB.
+        await outboxRecoveryWriteFenceRef.current.catch(() => undefined);
+        const records = await listCachedLivePackets(120);
+        const now = Date.now();
+        let expiredAcknowledgement = false;
+        for (const [packetId, sentAt] of outboxInFlightRef.current) {
+          if (now - Number(sentAt || 0) < OUTBOX_ACK_TIMEOUT_MS) continue;
+          outboxInFlightRef.current.delete(packetId);
+          expiredAcknowledgement = true;
+        }
+        if (expiredAcknowledgement) {
+          outboxRecoveringRef.current = true;
+          outboxRecoveryCutoffSequenceRef.current = Math.max(
+            Number(outboxRecoveryCutoffSequenceRef.current) || 0,
+            liveClientSequenceRef.current,
+          );
+          outboxRecoveryCutoffCapturedAtRef.current = Math.max(
+            Number(outboxRecoveryCutoffCapturedAtRef.current) || 0,
+            now,
+          );
+          outboxEmptyPassesRef.current = 0;
+        }
+        const recoveryCutoff = Number(outboxRecoveryCutoffSequenceRef.current) || 0;
+        const recoveryCapturedAtCutoff = Number(outboxRecoveryCutoffCapturedAtRef.current) || 0;
+        const recoveryRecords = outboxRecoveringRef.current
+          ? records.filter((record) => isHistoricalRecoveryRecord(record, recoveryCutoff, recoveryCapturedAtCutoff))
+          : [];
+        setLiveRelayState((current) => {
+          const outboxPending = recoveryRecords.length;
+          const outboxPendingMore = records.length >= 120 && recoveryRecords.length >= 120;
+          if (
+            current.outboxRecovering === outboxRecoveringRef.current
+            && current.outboxPending === outboxPending
+            && current.outboxPendingMore === outboxPendingMore
+          ) return current;
+          return {
+            ...current,
+            outboxRecovering: outboxRecoveringRef.current,
+            outboxPending,
+            outboxPendingMore,
+          };
+        });
+        // Keep reporting the local cache while offline, but do not consume or
+        // mark recovery complete until a server connection can ACK the data.
+        if (!socketReady) return;
+        if (recoveryRecords.length) outboxRecoveryHadRecordsRef.current = true;
+        const pendingRecords = recoveryRecords.filter((record) => !outboxInFlightRef.current.has(record.packetId));
+        if (pendingRecords.length) {
+          outboxEmptyPassesRef.current = 0;
+        } else if (!recoveryRecords.length) {
+          outboxEmptyPassesRef.current += 1;
+          if (outboxEmptyPassesRef.current >= 2) {
+            const completedRecovery = outboxRecoveringRef.current && outboxRecoveryHadRecordsRef.current;
+            outboxRecoveringRef.current = false;
+            outboxRecoveryCutoffSequenceRef.current = 0;
+            outboxRecoveryCutoffCapturedAtRef.current = 0;
+            outboxRecoveryHadRecordsRef.current = false;
+            setLiveRelayState((current) => ({
+              ...current,
+              outboxRecovering: false,
+              outboxPending: 0,
+              outboxPendingMore: false,
+            }));
+            if (completedRecovery && socket.readyState === 1) {
+              const recoveredEventIds = [...outboxBackfillAtByEventRef.current.keys()].filter(Boolean);
+              const activeEventId = eventsRef.current.find((event) => event.active)?.id || "";
+              if (!recoveredEventIds.length && activeEventId) recoveredEventIds.push(activeEventId);
+              for (const eventId of recoveredEventIds) {
+                socket.send(JSON.stringify({
+                  type: "live_backfill_complete",
+                  room: LIVE_ROOM_ID,
+                  eventId,
+                }));
+              }
+              outboxBackfillAtByEventRef.current = new Map();
+            }
+          } else scheduleOutboxFlush(200);
+          return;
+        } else {
+          scheduleOutboxFlush(OUTBOX_REPLAY_INTERVAL_MS);
+          return;
+        }
+        let sent = 0;
+        const skippedPacketIds = [];
+        const availableSlots = Math.min(
+          OUTBOX_REPLAY_BATCH_SIZE,
+          Math.max(0, OUTBOX_MAX_IN_FLIGHT - outboxInFlightRef.current.size),
+        );
+        for (const record of pendingRecords) {
+          const eventKey = String(record.eventId || "");
+          const capturedAt = Number(record.capturedAt) || 0;
+          const lastBackfillAt = outboxBackfillAtByEventRef.current.get(eventKey) || 0;
+          if (lastBackfillAt && capturedAt - lastBackfillAt < OUTBOX_REPLAY_MIN_INTERVAL_MS) {
+            skippedPacketIds.push(record.packetId);
+            continue;
+          }
+          if (sent >= availableSlots || socket.bufferedAmount > 256 * 1024) break;
+          outboxBackfillAtByEventRef.current.set(eventKey, capturedAt);
+          outboxInFlightRef.current.set(record.packetId, Date.now());
+          socket.send(JSON.stringify({
+            type: "live_batch",
+            room: LIVE_ROOM_ID,
+            batch: record.batch,
+            clientTime: record.capturedAt,
+            clientSequence: record.clientSequence,
+            packetId: record.packetId,
+            eventId: record.eventId,
+            backfill: true,
+            persistOnly: true,
+          }));
+          sent += 1;
+        }
+        if (skippedPacketIds.length) await deleteCachedLivePacket(skippedPacketIds);
+        scheduleOutboxFlush(sent ? OUTBOX_REPLAY_INTERVAL_MS : 500);
+      } catch (error) {
+        setLiveRelayState((current) => ({
+          ...current,
+          outboxError: `断网缓存扫描失败：${error.message || "IndexedDB 不可用"}`,
+        }));
+        scheduleOutboxFlush(3000);
+      }
+    }, Math.max(0, delayMs));
+  }, [audience]);
 
+  const publishLivePacket = useCallback((packet, capturedAt = Date.now()) => {
+    if (audience) return;
     const now = performance.now();
-    const bufferedAmount = socket.bufferedAmount;
-    const minIntervalMs = bufferedAmount > 512 * 1024 ? 250 : bufferedAmount > 128 * 1024 ? 100 : 30;
+    const minIntervalMs = 30;
     liveRelayRef.current.minIntervalMs = minIntervalMs;
-    if (now - liveRelayRef.current.lastSentAt < minIntervalMs) return;
-
     liveRelayRef.current.lastSentAt = now;
-    socket.send(JSON.stringify({
-      type: "live_batch",
-      room: LIVE_ROOM_ID,
-      batch: stripLocalSerialTelemetry(packet),
-      clientTime: Date.now(),
-    }));
+    const batch = stripLocalSerialTelemetry(packet);
+    const activeEventId = eventsRef.current.find((event) => event.active)?.id || "";
+    const persistenceSample = persistenceSampleRef.current;
+    const shouldSendDurableFrame = Boolean(activeEventId) && (
+      persistenceSample.eventId !== activeEventId
+      || capturedAt - persistenceSample.capturedAt >= PERSISTENCE_SAMPLE_INTERVAL_MS
+    );
+    if (!activeEventId) {
+      persistenceSample.eventId = "";
+      persistenceSample.capturedAt = 0;
+    }
+
+    if (!shouldSendDurableFrame) {
+      const socket = liveSocketRef.current;
+      if (socket?.readyState === 1 && socket.bufferedAmount <= 256 * 1024) {
+        socket.send(JSON.stringify({
+          type: "live_batch",
+          room: LIVE_ROOM_ID,
+          batch,
+          clientTime: capturedAt,
+          liveOnly: true,
+        }));
+      }
+    } else {
+      persistenceSample.eventId = activeEventId;
+      persistenceSample.capturedAt = capturedAt;
+      liveClientSequenceRef.current += 1;
+      const clientSequence = liveClientSequenceRef.current;
+      try {
+        window.localStorage.setItem(LIVE_SEQUENCE_STORAGE_KEY, String(clientSequence));
+      } catch {
+        // IndexedDB remains the source of truth for queued packet identifiers.
+      }
+      const packetId = `${liveSessionIdRef.current}:${clientSequence}`;
+      // Persist a per-receiver latest-value snapshot. The hardware protocol is
+      // allowed to emit partial batches, so sampling the current serial packet
+      // alone can starve receivers when several are connected.
+      const persistenceBatch = buildPersistenceSerialSnapshot(serialLatestRef.current, capturedAt) || batch;
+      const outgoing = {
+        type: "live_batch",
+        room: LIVE_ROOM_ID,
+        batch: persistenceBatch,
+        clientTime: capturedAt,
+        clientSequence,
+        packetId,
+        eventId: activeEventId,
+        liveOnly: true,
+        durable: true,
+      };
+      outboxWriteChainRef.current = outboxWriteChainRef.current
+        .catch(() => undefined)
+        .then(async () => {
+          try {
+            await cacheLivePacket({ packetId, eventId: activeEventId, clientSequence, capturedAt, batch: persistenceBatch });
+            setLiveRelayState((current) => (
+              current.outboxError ? { ...current, outboxError: "" } : current
+            ));
+            return true;
+          } catch (error) {
+            const outboxError = `断网缓存写入失败：${error.message || "IndexedDB 不可用"}`;
+            setLiveRelayState((current) => ({ ...current, outboxError }));
+            pushStatus(outboxError);
+            return false;
+          }
+        })
+        .then((cached) => {
+          const persistenceSocket = liveSocketRef.current;
+          if (!cached) {
+            // Online persistence can still succeed, but explicitly avoid
+            // claiming offline safety when the durable browser copy failed.
+            if (persistenceSocket?.readyState === 1 && persistenceSocket.bufferedAmount <= 256 * 1024) {
+              persistenceSocket.send(JSON.stringify(outgoing));
+            }
+            return;
+          }
+          if (!shouldSendCurrentPersistence(persistenceSocket?.readyState, outboxRecoveringRef.current)) {
+            outboxRecoveringRef.current = true;
+            outboxRecoveryCutoffSequenceRef.current = Math.max(
+              Number(outboxRecoveryCutoffSequenceRef.current) || 0,
+              clientSequence,
+            );
+            outboxRecoveryCutoffCapturedAtRef.current = Math.max(
+              Number(outboxRecoveryCutoffCapturedAtRef.current) || 0,
+              capturedAt,
+            );
+            scheduleOutboxFlush(100);
+            return;
+          }
+          // This is the selected 30 Hz live frame itself, upgraded with durable
+          // metadata after it has reached IndexedDB. Recovery never holds this
+          // current frame behind an old backlog; old records drain separately
+          // as backfill + persistOnly packets.
+          outboxInFlightRef.current.set(packetId, Date.now());
+          persistenceSocket.send(JSON.stringify(outgoing));
+          // If the TCP/WebSocket stack stays OPEN across a short network loss,
+          // there may be no close event to clear this entry. The watchdog scan
+          // retries any packet that has no server ACK after three seconds.
+          scheduleOutboxFlush(OUTBOX_ACK_TIMEOUT_MS);
+        });
+    }
     const wallNow = Date.now();
     if (wallNow - (liveRelayRef.current.lastUiAt || 0) >= 250) {
       liveRelayRef.current.lastUiAt = wallNow;
@@ -1057,7 +1464,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
         error: "",
       }));
     }
-  }, [audience]);
+  }, [audience, scheduleOutboxFlush]);
 
   const publishLiveState = useCallback((state) => {
     if (audience) return;
@@ -1115,8 +1522,26 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
 
       socket.addEventListener("open", () => {
         if (stopped) return;
+        setLiveSyncVersion((value) => value + 1);
         const mode = audience ? "subscribe_live" : "publish_live";
-        socket.send(JSON.stringify({ type: mode, room: LIVE_ROOM_ID }));
+        socket.send(JSON.stringify({
+          type: mode,
+          room: LIVE_ROOM_ID,
+          afterSequence: audience ? audienceSequenceRef.current : 0,
+        }));
+        if (!audience) {
+          outboxRecoveringRef.current = true;
+          // Freeze the recovery generation at reconnect time. New 5 Hz packets
+          // created after the socket reopens use larger client sequences and
+          // must not keep the historical generation from ever becoming empty.
+          outboxRecoveryCutoffSequenceRef.current = liveClientSequenceRef.current;
+          outboxRecoveryCutoffCapturedAtRef.current = Date.now();
+          outboxRecoveryWriteFenceRef.current = outboxWriteChainRef.current;
+          outboxEmptyPassesRef.current = 0;
+          outboxRecoveryHadRecordsRef.current = false;
+          outboxBackfillAtByEventRef.current = new Map();
+          scheduleOutboxFlush(0);
+        }
         setLiveRelayState((current) => ({
           ...current,
           connected: true,
@@ -1132,24 +1557,118 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
         } catch {
           return;
         }
-        if (audience && message.type === "live_batch" && message.batch) {
-          const line = JSON.stringify(message.batch);
-          updateSerialFromPacket(message.batch, line, message.serverTime || Date.now());
+        if (audience && message.streamId && message.streamId !== audienceStreamIdRef.current) {
+          const streamChanged = Boolean(audienceStreamIdRef.current);
+          audienceStreamIdRef.current = message.streamId;
+          audienceSequenceRef.current = 0;
+          if (streamChanged) setLiveSyncVersion((value) => value + 1);
         }
-        if (audience && message.type === "live_state" && message.state) {
+        if (!audience && message.type === "live_packet_ack" && message.packetId) {
+          if (message.accepted) {
+            // Keep the packet protected until the IndexedDB deletion really
+            // commits. Removing it from in-flight first creates a race where
+            // the recovery scanner sees the still-present record and resends
+            // it as backfill even though the network never disconnected.
+            void deleteCachedLivePacket(message.packetId)
+              .then(() => {
+                outboxInFlightRef.current.delete(message.packetId);
+                scheduleOutboxFlush(100);
+              })
+              .catch((error) => {
+                outboxInFlightRef.current.delete(message.packetId);
+                outboxRecoveringRef.current = true;
+                outboxRecoveryCutoffSequenceRef.current = Math.max(
+                  Number(outboxRecoveryCutoffSequenceRef.current) || 0,
+                  Number(message.clientSequence) || 0,
+                );
+                outboxRecoveryCutoffCapturedAtRef.current = Math.max(
+                  Number(outboxRecoveryCutoffCapturedAtRef.current) || 0,
+                  Date.now(),
+                );
+                const outboxError = `断网缓存确认失败，将重试：${error.message || "IndexedDB 删除失败"}`;
+                setLiveRelayState((current) => ({ ...current, outboxError }));
+                scheduleOutboxFlush(500);
+              });
+          } else {
+            outboxInFlightRef.current.delete(message.packetId);
+            outboxRecoveringRef.current = true;
+            outboxRecoveryCutoffSequenceRef.current = Math.max(
+              Number(outboxRecoveryCutoffSequenceRef.current) || 0,
+              Number(message.clientSequence) || 0,
+            );
+            outboxRecoveryCutoffCapturedAtRef.current = Math.max(
+              Number(outboxRecoveryCutoffCapturedAtRef.current) || 0,
+              Date.now(),
+            );
+            scheduleOutboxFlush(500);
+          }
+        }
+        if (audience && message.type === "live_resync_required") {
+          audienceSequenceRef.current = Math.max(audienceSequenceRef.current, Number(message.latestSequence) || 0);
+          setLiveSyncVersion((value) => value + 1);
+        }
+        if (message.type === "live_timeline_resync") {
+          setLiveStateSeed((current) => {
+            const currentEventId = current?.event?.id || current?.eventId || "";
+            if (message.eventId && currentEventId && message.eventId !== currentEventId) return current;
+            // The full snapshot received when this socket joined may predate
+            // the just-finished backfill. Keep it on screen until REST/full
+            // state arrives, but stop treating it as a newer authoritative
+            // baseline that can overwrite the rebuilt historical gap.
+            return current ? { ...current, bandsComplete: false } : current;
+          });
+          setLiveSyncVersion((value) => value + 1);
+        }
+        if (audience && message.type === "live_batch" && message.batch) {
+          const sequence = Number(message.sequence) || 0;
+          const previousSequence = audienceSequenceRef.current;
+          if (sequence && sequence <= previousSequence) return;
+          if (sequence) audienceSequenceRef.current = sequence;
+          const line = JSON.stringify(message.batch);
+          updateSerialFromPacket(message.batch, line, message.sampleTime || message.serverTime || Date.now());
+        }
+        if (!audience && message.type === "live_batch" && message.source === "virtual_receiver" && message.batch) {
+          const capturedAt = message.sampleTime || message.serverTime || Date.now();
+          setSerialState((current) => ({
+            ...current,
+            supported: true,
+            connected: true,
+            connecting: false,
+            portName: "虚拟测试阵列",
+            baudRate: 115200,
+            error: "",
+          }));
+          updateSerialFromPacket(message.batch, JSON.stringify(message.batch), capturedAt);
+        }
+        if (message.type === "live_state" && message.state) {
           const latest = message.state.latestSamplesByReceiver || {};
           const now = Date.now();
-          const hasRecentLiveBatch = now - Number(serialStateRef.current?.lastDataAt || 0) < 2000;
-          if (!hasRecentLiveBatch || message.state.bandsByPilot || message.state.samplesByPilot) {
-            setLiveStateSeed({ ...message.state, receivedAt: now });
+          const hasAuthoritativeStats = Boolean(message.state.serverManaged || message.state.summaries || message.state.bandsByPilot);
+          if (hasAuthoritativeStats) {
+            setLiveStateSeed((current) => {
+              const next = { ...message.state, receivedAt: now };
+              const currentEventId = current?.event?.id || current?.eventId || "";
+              const nextEventId = next.event?.id || next.eventId || "";
+              const sameEvent = Boolean(currentEventId && currentEventId === nextEventId);
+              const receivedCompleteTimeline = Boolean(next.bandsByPilot);
+              // Normal server heartbeats contain only the recent SQLite suffix.
+              // Accumulate each suffix into the last complete join/reconnect
+              // timeline. Merely preserving the original full snapshot made
+              // older suffixes fall out of the rolling window and briefly
+              // disappear from the rendered history.
+              const baselineBands = next.bandsByPilot || (sameEvent ? current?.bandsByPilot : null) || {};
+              next.bandsByPilot = mergeLiveBandMaps(baselineBands, next.bandUpdatesByPilot || {});
+              next.bandsComplete = receivedCompleteTimeline || Boolean(sameEvent && current?.bandsComplete);
+              return next;
+            });
           }
-          if (!serialStateRef.current?.lastDataAt && Object.keys(latest).length) {
+          if (audience && !serialStateRef.current?.lastDataAt && Object.keys(latest).length) {
             serialLatestRef.current = latest;
             requestSerialRender();
           }
-          if (Array.isArray(message.state.events)) {
+          if (audience && Array.isArray(message.state.events)) {
             setEvents((current) => (sameEvents(current, message.state.events) ? current : message.state.events));
-          } else if (message.state.event?.id) {
+          } else if (audience && message.state.event?.id) {
             setEvents((current) => {
               const liveEvent = { ...message.state.event, active: Boolean(message.state.event.active) };
               const next = current.map((eventItem) => (
@@ -1158,14 +1677,14 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
               const merged = next.some((eventItem) => eventItem.id === liveEvent.id) ? next : [liveEvent, ...next];
               return sameEvents(current, merged) ? current : merged;
             });
-          } else {
+          } else if (audience) {
             setEvents((current) => {
               const next = current.map((eventItem) => ({ ...eventItem, active: false }));
               return sameEvents(current, next) ? current : next;
             });
           }
           const relayReceiverState = message.state.receiverState || {};
-          if (Object.keys(relayReceiverState).length) {
+          if (audience && Object.keys(relayReceiverState).length) {
             setSerialState((current) => ({
               ...current,
               ...relayReceiverState,
@@ -1178,7 +1697,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
                 : current.lastReceiverId,
               error: relayReceiverState.error || "",
             }));
-          } else {
+          } else if (audience) {
             const receiverIds = Object.keys(latest).map(Number);
             setSerialState((current) => ({
               ...current,
@@ -1207,12 +1726,27 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
       });
 
       socket.addEventListener("error", () => {
+        if (!audience) {
+          outboxRecoveringRef.current = true;
+          outboxRecoveryCutoffSequenceRef.current = Math.max(
+            Number(outboxRecoveryCutoffSequenceRef.current) || 0,
+            liveClientSequenceRef.current,
+          );
+          outboxRecoveryCutoffCapturedAtRef.current = Math.max(
+            Number(outboxRecoveryCutoffCapturedAtRef.current) || 0,
+            Date.now(),
+          );
+          outboxRecoveryWriteFenceRef.current = outboxWriteChainRef.current;
+          outboxInFlightRef.current.clear();
+        }
         pushStatus("实时中继连接异常");
         setLiveRelayState((current) => ({ ...current, error: "实时中继连接异常" }));
       });
 
       socket.addEventListener("close", () => {
         if (liveSocketRef.current === socket) liveSocketRef.current = null;
+        outboxInFlightRef.current.clear();
+        outboxBackfillAtByEventRef.current = new Map();
         setLiveRelayState((current) => ({ ...current, connected: false }));
         if (!stopped) reconnectTimer = window.setTimeout(connectLiveSocket, 2000);
       });
@@ -1222,10 +1756,11 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
     return () => {
       stopped = true;
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (outboxFlushTimerRef.current) window.clearTimeout(outboxFlushTimerRef.current);
       liveSocketRef.current?.close();
       liveSocketRef.current = null;
     };
-  }, [audience, requestSerialRender, updateSerialFromPacket]);
+  }, [audience, requestSerialRender, scheduleOutboxFlush, updateSerialFromPacket]);
 
   useEffect(() => {
     if (audience || !navigator.serial) return undefined;
@@ -1240,19 +1775,19 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
       }, delayMs);
     }
 
-    function handleSerialConnect(event) {
+    function handleSerialConnect() {
       if (manualSerialDisconnectRef.current) return;
-      const port = event.target;
-      if (isTrainingHubPort(port)) {
-        void openSerialPort(port);
-      } else {
-        scheduleAutoConnect(300);
-      }
+      // A flight controller can re-enumerate with the same 0483:5740 VID/PID
+      // as TRAINING_HUB. Never replace a healthy receiver-array connection just
+      // because another STM32 serial device appeared; run the normal claimed /
+      // preferred-port selection only when the array is actually disconnected.
+      if (portRef.current || serialConnectInFlightRef.current) return;
+      scheduleAutoConnect(300);
     }
 
     function handleSerialDisconnect(event) {
       if (event.target !== portRef.current) return;
-      void releaseSerialResources({ clear: true, error: "Serial disconnected" });
+      void releaseSerialResources({ clear: true, error: "Serial disconnected", preserveSamples: true });
       scheduleAutoConnect(800);
     }
 
@@ -1264,10 +1799,14 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
     navigator.serial.addEventListener("disconnect", handleSerialDisconnect);
     window.addEventListener("pagehide", handlePageHide);
     scheduleAutoConnect(0);
+    const retryInterval = window.setInterval(() => {
+      if (!stopped) void autoConnectSerialArray();
+    }, 2000);
 
     return () => {
       stopped = true;
       if (serialReconnectTimerRef.current) window.clearTimeout(serialReconnectTimerRef.current);
+      window.clearInterval(retryInterval);
       navigator.serial.removeEventListener("connect", handleSerialConnect);
       navigator.serial.removeEventListener("disconnect", handleSerialDisconnect);
       window.removeEventListener("pagehide", handlePageHide);
@@ -1279,7 +1818,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
 
   async function readSerialLoop(port) {
     const decoder = new TextDecoder();
-    let buffer = "";
+    let jsonBuffer = "";
     serialLoopRef.current = true;
     while (serialLoopRef.current && port.readable) {
       const reader = port.readable.getReader();
@@ -1288,34 +1827,51 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
         while (serialLoopRef.current) {
           const { value, done } = await reader.read();
           if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-          for (const rawLine of lines) {
-            const line = rawLine.trim();
-            if (!line) continue;
-            const parsed = parseSerialLine(line);
-            if (parsed) {
-              updateSerialFromPacket(parsed.packet, parsed.line);
-              publishLivePacket(parsed.packet);
-            } else {
-              pushStatus(`串口 JSON 解析失败：${line.slice(0, 80)}`);
-              setSerialState((current) => ({ ...current, error: `串口 JSON 解析失败：${line.slice(0, 80)}` }));
-            }
+          const decoded = decoder.decode(value, { stream: true });
+          const consumed = consumeSerialJsonStream(jsonBuffer, decoded);
+          jsonBuffer = consumed.buffer;
+          for (const parsed of consumed.frames) {
+            const capturedAt = Date.now();
+            updateSerialFromPacket(parsed.packet, parsed.line, capturedAt);
+            publishLivePacket(parsed.packet, capturedAt);
+          }
+          // A leading tail after USB reconnect is discarded silently. Only a
+          // complete, balanced object that is still invalid JSON is an actual
+          // protocol error worth surfacing.
+          for (const failedFrame of consumed.failures.slice(-1)) {
+            const preview = failedFrame.replace(/\s+/g, " ").slice(0, 80);
+            pushStatus(`串口 JSON 解析失败：${preview}`);
+            setSerialState((current) => ({ ...current, error: `串口 JSON 解析失败：${preview}` }));
           }
         }
       } catch (error) {
         if (serialLoopRef.current) {
-          clearSerialConnection(`串口读取失败，已断开：${error.message}`);
+          try {
+            reader.releaseLock();
+          } catch {
+            // The stream may already have released its lock after a USB drop.
+          }
+          if (readerRef.current === reader) readerRef.current = null;
+          await releaseSerialResources({
+            clear: true,
+            error: `串口读取失败，正在自动重连：${error.message}`,
+            preserveSamples: true,
+          });
           return;
         }
       } finally {
-        reader.releaseLock();
+        try {
+          reader.releaseLock();
+        } catch {
+          // The error path above may already have released the lock.
+        }
         if (readerRef.current === reader) readerRef.current = null;
       }
       if (!serialLoopRef.current) break;
     }
-    if (portRef.current === port) clearSerialConnection("串口已断开");
+    if (portRef.current === port) {
+      await releaseSerialResources({ clear: true, error: "串口已断开，正在自动重连", preserveSamples: true });
+    }
   }
 
   async function connectSerialArray() {
@@ -1326,9 +1882,12 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
     }
     try {
       manualSerialDisconnectRef.current = false;
-      const port = await navigator.serial.requestPort({
-        filters: [{ usbVendorId: TRAINING_HUB_VENDOR_ID, usbProductId: TRAINING_HUB_PRODUCT_ID }],
-      });
+      // Manual selection deliberately shows all ports so a com0com test pair can
+      // be selected. Automatic reconnection remains restricted to TRAINING_HUB.
+      const port = await navigator.serial.requestPort();
+      if (await isBetaflightSerialPortClaimed(port)) {
+        throw new Error("所选串口正在被内置 BF 使用，请选择 TRAINING_HUB 或先断开 BF");
+      }
       await openSerialPort(port, { requested: true });
     } catch (error) {
       pushStatus(`串口连接失败：${error.message}`);
@@ -1353,6 +1912,10 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
   }
 
   async function bindSerialReceiver(receiverId = 1) {
+    if (serialStateRef.current?.portName === "虚拟测试阵列") {
+      setSerialState((current) => ({ ...current, error: "", lastCommand: `BIND:${receiverId}（测试模拟）` }));
+      return;
+    }
     if (!portRef.current?.writable) {
       throw new Error("串口未连接");
     }
@@ -1368,7 +1931,8 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
   }
 
   const tabs = [
-    ["pilots", "飞手库"],
+    ["skill-tree", "技能树管理"],
+    ["pilots", "飞手档案"],
     ["events", "事件和系统"],
     ["tracks", "赛道管理"],
     ["monitor", "实时监测"],
@@ -1657,6 +2221,47 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
   }
 
   function renderStatusLogBar() {
+    const ingest = csvWriteStatus?.ingest || null;
+    const ingestHistoryLagMs = ingest?.lastPersistedSampleTime
+      ? Math.max(0, Number(ingest.lastProcessedAt || Date.now()) - Number(ingest.lastPersistedSampleTime))
+      : 0;
+    const ingestHasPersistenceMetrics = ingest && Object.hasOwn(ingest, "lastPacketPersistedSamples");
+    const ingestNoActiveEvent = Boolean(ingest?.lastPacketNoActiveEvent);
+    const ingestUnassignedReceiverIds = Array.isArray(ingest?.lastPacketUnassignedReceiverIds)
+      ? ingest.lastPacketUnassignedReceiverIds
+      : [];
+    const ingestMissingPilotIds = Array.isArray(ingest?.lastPacketMissingPilotIds)
+      ? ingest.lastPacketMissingPilotIds
+      : [];
+    const ingestHasNoMapping = Boolean(
+      !ingestNoActiveEvent
+      && ingest?.lastPacketRawSamples > 0
+      && ingest?.lastPacketMappedSamples === 0,
+    );
+    const ingestIsStalled = Boolean(
+      ingestHasPersistenceMetrics
+      && ingest?.lastPacketMappedSamples > 0
+      && ingestHistoryLagMs > 3000,
+    );
+    const ingestIsBacklogged = Boolean(ingest?.oldestQueuedMs > 1000 || ingestIsStalled);
+    const ingestStatusText = ingestIsBacklogged
+      ? `历史尾部落后 ${formatHistoryLag(ingestHistoryLagMs)}`
+      : ingestNoActiveEvent
+        ? "尚未开始事件，实时显示正常，历史暂停"
+      : ingestHasNoMapping
+        ? ingestUnassignedReceiverIds.length
+          ? `接收机未加入当前事件：${ingestUnassignedReceiverIds.join("、")}`
+          : ingestMissingPilotIds.length
+            ? "事件中的飞手档案不存在"
+            : "当前事件没有可映射的飞手"
+        : ingest?.backfillQueuedPackets
+          ? `当前入库正常，后台补传 ${ingest.backfillQueuedPackets} 包`
+          : "正常";
+    const ingestStatusColor = ingestIsBacklogged || ingestHasNoMapping
+      ? "#b91c1c"
+      : ingestNoActiveEvent || ingest?.backfillQueuedPackets
+        ? "#b45309"
+        : "#15803d";
     return (
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 10, alignItems: "start", marginTop: 10, width: "100%", maxWidth: 920, marginLeft: "auto", marginRight: "auto" }}>
         <div style={{ display: "flex", gap: 8, alignItems: "flex-start", minWidth: 0 }}>
@@ -1702,6 +2307,46 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
                   <span>CSV 文件：{formatBytes(csvWriteStatus.fileSizeBytes)}</span>
                   <span>已写：{csvWriteStatus.writtenRows || 0} 行</span>
                   <span>最近写入：{csvWriteStatus.lastFlushMs || 0} ms</span>
+                  {csvWriteStatus.ingest && (
+                    <div style={{ gridColumn: "1 / -1", display: "grid", gap: 3, marginTop: 4, paddingTop: 7, borderTop: "1px dashed #cbd5e1" }}>
+                      <strong style={{ color: ingestStatusColor }}>
+                        服务器历史入库（约5Hz）：{ingestStatusText}
+                      </strong>
+                      <span>
+                        队列：当前 {csvWriteStatus.ingest.currentQueuedPackets || 0} / 回补 {csvWriteStatus.ingest.backfillQueuedPackets || 0} 包，最老 {csvWriteStatus.ingest.oldestQueuedMs || 0} ms；实时抽样合并 {csvWriteStatus.ingest.compactedCurrentPackets ?? csvWriteStatus.ingest.supersededPackets ?? 0} 包；回补抽样合并 {csvWriteStatus.ingest.compactedBackfillPackets || 0} 包；最近处理 {csvWriteStatus.ingest.lastProcessMs || 0} ms / 峰值 {csvWriteStatus.ingest.maxProcessMs || 0} ms
+                      </span>
+                      <span>
+                        最近当前包落库 {csvWriteStatus.ingest.lastPacketPersistedSamples ?? "-"}/{csvWriteStatus.ingest.lastPacketMappedSamples || 0} 路；限频 {csvWriteStatus.ingest.lastPacketThrottledSamples || 0} 路；旧包 {csvWriteStatus.ingest.lastPacketStaleSamples || 0} 路；未分配 {csvWriteStatus.ingest.lastPacketUnmappedSamples || 0} 路；超出训练时间 {csvWriteStatus.ingest.lastPacketOutOfWindowSamples || 0} 路
+                      </span>
+                      <span>
+                        回补累计处理 {csvWriteStatus.ingest.backfillProcessedPackets || 0} 包 / 落库 {csvWriteStatus.ingest.backfillPersistedSamples || 0} 路；最近回补 {csvWriteStatus.ingest.lastBackfillProcessedAt ? formatStatusLogTime(csvWriteStatus.ingest.lastBackfillProcessedAt) : "无"}；最近重建 {csvWriteStatus.ingest.lastBackfillFinalizedAt ? formatStatusLogTime(csvWriteStatus.ingest.lastBackfillFinalizedAt) : "无"}
+                      </span>
+                      <span>
+                        回补跳过：限频 {csvWriteStatus.ingest.backfillThrottledSamples || 0} 路；旧包 {csvWriteStatus.ingest.backfillStaleSamples || 0} 路；未分配 {csvWriteStatus.ingest.backfillUnmappedSamples || 0} 路；超出训练时间 {csvWriteStatus.ingest.backfillOutOfWindowSamples || 0} 路；事件不存在 {csvWriteStatus.ingest.backfillMissingEventPackets || 0} 包；重复包 {csvWriteStatus.ingest.backfillDuplicatePackets || 0} 包
+                      </span>
+                    </div>
+                  )}
+                  {!audience && (
+                    <div style={{ gridColumn: "1 / -1", display: "grid", gap: 3, marginTop: 4, paddingTop: 7, borderTop: "1px dashed #cbd5e1" }}>
+                      <strong style={{ color: liveRelayState.outboxError ? "#b91c1c" : liveRelayState.outboxRecovering ? "#b45309" : "#15803d" }}>
+                        浏览器断网缓存：{liveRelayState.outboxError
+                          || (liveRelayState.outboxRecovering
+                            ? `回补中，当前可见 ${liveRelayState.outboxPendingMore ? "至少 " : ""}${liveRelayState.outboxPending || 0} 包`
+                            : "已启用")}
+                      </strong>
+                      <span>超过 {OUTBOX_ACK_TIMEOUT_MS / 1000} 秒未收到服务器 ACK 会自动重发；此状态来自教练端 IndexedDB，不依赖服务器在线。</span>
+                    </div>
+                  )}
+                  {csvWriteStatus.audienceDownload && (
+                    <div style={{ gridColumn: "1 / -1", display: "grid", gap: 3, marginTop: 4, paddingTop: 7, borderTop: "1px dashed #cbd5e1" }}>
+                      <strong style={{ color: audiencePressureColor(csvWriteStatus.audienceDownload.pressureLevel) }}>
+                        观众下载压力：{audiencePressureText(csvWriteStatus.audienceDownload.pressureLevel)} · {csvWriteStatus.audienceDownload.audienceCount || 0} 人 · {formatBitRate(csvWriteStatus.audienceDownload.bitsPerSecond)} / {Number(csvWriteStatus.audienceDownload.capacityMbps || 3).toFixed(1)} Mbps（{Math.round(csvWriteStatus.audienceDownload.utilizationPercent || 0)}%）
+                      </strong>
+                      <span>
+                        实时上限：{csvWriteStatus.audienceDownload.targetLiveFps || 30} Hz/人；连接积压：{formatBytes(csvWriteStatus.audienceDownload.bufferedBytes)}；丢弃旧帧 {csvWriteStatus.audienceDownload.skippedMessages || 0} 包
+                      </span>
+                    </div>
+                  )}
                   {csvWriteStatus.lastError && <span style={{ gridColumn: "1 / -1", color: "#b91c1c" }}>{csvWriteStatus.lastError}</span>}
                 </div>
               )}
@@ -1721,7 +2366,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
 
   if (audience) {
     return (
-      <div style={{ minHeight: "100vh", width: "100%", maxWidth: "100%", overflowX: "hidden", boxSizing: "border-box", background: "#f5f7fb", padding: "clamp(10px, 4vw, 20px)", fontFamily: "'Microsoft YaHei','寰蒋闆呴粦',Arial,sans-serif", letterSpacing: 0, color: "#111827" }}>
+      <div style={{ minHeight: "100vh", width: "100%", maxWidth: "100%", overflowX: "hidden", boxSizing: "border-box", background: "#f5f7fb", padding: "clamp(10px, 4vw, 20px)", fontFamily: "'Microsoft YaHei',Arial,sans-serif", letterSpacing: 0, color: "#111827" }}>
         <header style={headerStyle}>
           <div style={headerTitleBlockStyle}>
             <h1 style={titleStyle}>
@@ -1732,17 +2377,23 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
           </div>
           <div style={headerActionsStyle}>
             <button type="button" style={buttonStyle} onClick={onBack}>返回首页</button>
+            {bracketLive && onOpenBracket && (
+              <button type="button" className="live-jump-button" style={buttonStyle} onClick={onOpenBracket} title="查看正在进行的双败淘汰赛">
+                <span className="live-status-dot" aria-hidden="true" />
+                比赛进行中
+              </button>
+            )}
           </div>
         </header>
         <div style={{ display: "grid", gap: 14 }}>
-          <MonitorPage pilots={pilots} events={events} latestSamplesRef={serialLatestRef} renderTick={serialRenderTick} inputFps={serialInputFps} stateSeed={liveStateSeed} />
+          <MonitorPage pilots={pilots} events={events} latestSamplesRef={serialLatestRef} sampleQueuesRef={serialSamplesRef} renderTick={serialRenderTick} inputFps={serialInputFps} stateSeed={liveStateSeed} resyncToken={liveSyncVersion} audience={audience} />
         </div>
       </div>
     );
   }
 
   return (
-    <div style={{ minHeight: "100vh", width: "100%", maxWidth: "100%", overflowX: "hidden", boxSizing: "border-box", background: "#f5f7fb", padding: "clamp(10px, 4vw, 20px)", fontFamily: "'Microsoft YaHei','寰蒋闆呴粦',Arial,sans-serif", letterSpacing: 0, color: "#111827" }}>
+    <div style={{ minHeight: "100vh", width: "100%", maxWidth: "100%", overflowX: "hidden", boxSizing: "border-box", background: "#f5f7fb", padding: "clamp(10px, 4vw, 20px)", fontFamily: "'Microsoft YaHei',Arial,sans-serif", letterSpacing: 0, color: "#111827" }}>
       <header style={headerStyle}>
         <div style={headerTitleBlockStyle}>
           <h1 style={titleStyle}>
@@ -1763,6 +2414,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
         </div>
       </header>
 
+      {tab === "skill-tree" && <SkillTreePage />}
       {tab === "pilots" && <PilotLibraryPage key={pilots.map((pilot) => `${pilot.id}:${pilot.updatedAt || ""}:${pilot.name}`).join("|")} pilots={pilots} onSave={savePilots} />}
       {tab === "events" && <EventPage pilots={pilots} events={events} live={displayLive} serialState={serialState} serialPower={serialState.power} onConnectSerial={connectSerialArray} onDisconnectSerial={disconnectSerialArray} onSaveEvents={saveEvents} onBindReceiver={async (id) => {
         try {
@@ -1780,10 +2432,17 @@ export default function TrainingSystem({ onBack, onOpenBracket, audience = false
       }} />}
       {tab === "tracks" && <TrackManagementPage />}
       <div style={{ display: tab === "monitor" ? "block" : "none" }}>
-        <MonitorPage pilots={pilots} events={events} latestSamplesRef={serialLatestRef} renderTick={serialRenderTick} inputFps={serialInputFps} />
+        <MonitorPage pilots={pilots} events={events} latestSamplesRef={serialLatestRef} sampleQueuesRef={serialSamplesRef} renderTick={serialRenderTick} inputFps={serialInputFps} stateSeed={liveStateSeed} resyncToken={liveSyncVersion} />
       </div>
       {tab === "coach" && <CoachPage />}
-      {tab === "history" && <HistoryPage events={events} onDeleteEvent={async (eventId) => {
+      {tab === "history" && <HistoryPage events={events} onEventUpdated={(updatedEvent) => {
+        if (!updatedEvent?.id) return;
+        setEvents((current) => {
+          const nextEvents = current.map((event) => (event.id === updatedEvent.id ? updatedEvent : event));
+          publishTrainingState(nextEvents);
+          return nextEvents;
+        });
+      }} onDeleteEvent={async (eventId) => {
         setEvents((current) => {
           const nextEvents = current.filter((event) => event.id !== eventId);
           publishTrainingState(nextEvents);

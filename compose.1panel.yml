@@ -1,0 +1,21 @@
+services:
+  fpv-training-system:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NPM_REGISTRY: https://registry.npmmirror.com
+    image: fpv-training-system:custom-bf
+    container_name: fpv-training-system
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      BETAFLIGHT_MODERN_DIST_DIR: /app/betaflight-dist
+      BETAFLIGHT_LEGACY_DIST_DIR: /app/betaflight-legacy-dist
+    volumes:
+      - ./data:/app/data

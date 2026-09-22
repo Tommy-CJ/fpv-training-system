@@ -11,6 +11,18 @@ node_modules
 dist
 dist-ssr
 *.local
+.playwright-cli/
+
+# Accidental copies of Vite's generated web root. Source assets live in public/.
+/assets/
+/favicon.svg
+/icons.svg
+/logo_single.png
+
+# Extracted, customized Betaflight sources are versioned; downloaded archives
+# and their independent repository metadata are not part of this repository.
+/vendor/*.zip
+/vendor/**/.git/
 
 # Local runtime data. Do not publish training history or SQLite databases.
 data/
@@ -20,6 +32,7 @@ Codenpm-cache/
 .env
 .env.*
 !.env.example
+qweather-ed25519-*.pem
 *.db
 *.db-journal
 *.sqlite
