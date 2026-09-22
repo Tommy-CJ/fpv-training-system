@@ -1,0 +1,6 @@
+build/
+.settings/
+.vscode/
+mx.scratch/
+*.elf
+*.map
