@@ -2,6 +2,7 @@
 import { createPortal } from "react-dom";
 import { apiDelete, apiGet, apiPost, formatClock, formatDuration, inputStyle, isValueInRanges, panelStyle, primaryButtonStyle } from "../trainingShared.js";
 import { getCoachPassword, setCoachPassword, validateCoachPassword } from "../authConfig.js";
+import { samplesFromLiveState } from "../monitorSeedSamples.js";
 
 const CHANNEL_MIN = 1000;
 const CHANNEL_MID = 1500;
@@ -162,18 +163,6 @@ function bandsFromSegments(segments = []) {
     .sort((a, b) => a.start - b.start);
 }
 
-function sampleFromBand(band, time, pilotId, receiverId, latestSample) {
-  return {
-    ...(latestSample || {}),
-    time,
-    pilotId,
-    receiverId,
-    armed: band.state === "flying" || band.state === "turtle",
-    flying: band.state === "flying",
-    turtle: band.state === "turtle",
-  };
-}
-
 function optionalTimestamp(value) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : null;
@@ -183,28 +172,6 @@ function getParticipantTrainingWindow(eventStart, participant, now = Date.now())
   const start = Math.max(eventStart, optionalTimestamp(participant?.trainingStartAt) || eventStart);
   const end = Math.max(start, optionalTimestamp(participant?.trainingEndAt) || now);
   return { start, end };
-}
-
-function samplesFromLiveState(seed, pilotId, receiverId) {
-  const storedSamples = seed?.samplesByPilot?.[pilotId];
-  if (storedSamples?.length) {
-    return storedSamples
-      .filter((sample) => Number(sample.receiverId) === Number(receiverId))
-      .map((sample) => ({ ...sample, pilotId, receiverId }))
-      .sort((a, b) => a.time - b.time);
-  }
-  const latestSample = seed?.latestSamplesByReceiver?.[receiverId] || null;
-  if (!latestSample) return [];
-  const bands = seed?.bandsByPilot?.[pilotId] || [];
-  const restored = [];
-  for (const band of bands) {
-    for (let time = band.start; time < band.end; time += MAX_SAMPLE_GAP_MS) {
-      restored.push(sampleFromBand(band, time, pilotId, receiverId, latestSample));
-    }
-    restored.push(sampleFromBand(band, band.end, pilotId, receiverId, latestSample));
-  }
-  if (latestSample) restored.push({ ...latestSample, pilotId, receiverId });
-  return restored.sort((a, b) => a.time - b.time);
 }
 
 function getRenderableBands(bands, windowStart, windowMs) {
@@ -1254,7 +1221,7 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
       };
     }
 
-    const seedSamples = samplesFromLiveState(stateSeed, pilot.id, participant.receiverId);
+    const seedSamples = samplesFromLiveState(stateSeed, pilot.id, participant.receiverId, RECENT_SAMPLE_WINDOW_MS, MAX_SAMPLE_GAP_MS);
     const restored = [];
     const authoritativeBands = seededBands.length ? seededBands : authoritativeBandsRef.current;
     const authoritativeEnd = authoritativeBands.length
@@ -1264,11 +1231,10 @@ const PilotMonitorCard = memo(function PilotMonitorCard({ index, pilot, particip
     for (const rawSeed of seedSamples) {
       if (rawSeed.time < trainingStart) continue;
       const rawSample = { ...rawSeed, pilotId: pilot.id, receiverId: participant.receiverId };
-      const recent = restored.filter((item) => item.time >= rawSample.time - 5000);
       const hasStoredState = typeof rawSample.armed === "boolean" || typeof rawSample.flying === "boolean" || typeof rawSample.turtle === "boolean";
       const state = hasStoredState
         ? { armed: Boolean(rawSample.armed), flying: Boolean(rawSample.flying), turtle: Boolean(rawSample.turtle) }
-        : getPilotState(pilot, rawSample, [...recent, rawSample]);
+        : getPilotState(pilot, rawSample, [...getRecentSamples(restored, rawSample.time - 5000), rawSample]);
       restored.push({ ...rawSample, armed: state.armed, flying: state.flying, turtle: state.turtle });
     }
     for (let index = 0; index < restored.length - 1; index += 1) {

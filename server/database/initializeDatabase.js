@@ -34,6 +34,8 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_training_samples_event_pilot_time
     ON training_samples(event_id, pilot_id, time);
+  CREATE INDEX IF NOT EXISTS idx_training_samples_event_time
+    ON training_samples(event_id, time, pilot_id);
   CREATE INDEX IF NOT EXISTS idx_training_samples_event_receiver_time
     ON training_samples(event_id, receiver_id, time);
   CREATE TABLE IF NOT EXISTS training_receiver_assignments (

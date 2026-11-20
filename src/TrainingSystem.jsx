@@ -221,8 +221,8 @@ function replaceLiveBandMapRange(existingByPilot = {}, updatesByPilot = {}, repl
 
 const LIVE_ROOM_ID = "default";
 // CORE DATA-PLANE INVARIANTS (see docs/LIVE_DATA_PIPELINE.md):
-// - Online transport is one 30 Hz stream; selected ~5 Hz frames are upgraded
-//   in-place with durable metadata after IndexedDB commits.
+// - Worker serial transport owns current live broadcast. The Window still
+//   commits ~5 Hz durable snapshots before sending them for ACK/persistence.
 // - Never delete a durable record before the server ACK and local delete both
 //   complete. Historical replay is persistOnly and must never drive live UI.
 // - Recovery work is lower priority than current live/current durable frames.
@@ -233,10 +233,9 @@ const TRAINING_HUB_VENDOR_ID = 0x0483;
 const TRAINING_HUB_PRODUCT_ID = 0x5740;
 const LIVE_SESSION_STORAGE_KEY = "fpv-training-live-session";
 const LIVE_SEQUENCE_STORAGE_KEY = "fpv-training-live-sequence";
-// PROTECTED LIVE-PIPELINE CONTRACT: this ~5 Hz durable cadence is embedded in
-// the single 30 Hz live stream. It must remain IndexedDB-first and ACK-deleted;
-// do not replace it with a second online persistOnly stream or client-derived
-// flight state. See docs/LIVE_DATA_PIPELINE.md before changing this section.
+// PROTECTED LIVE-PIPELINE CONTRACT: selected ~5 Hz frames remain
+// IndexedDB-first and ACK-deleted. In Worker mode the live-only socket owns
+// broadcast, so these snapshots use persistOnly without backfill.
 const PERSISTENCE_SAMPLE_INTERVAL_MS = 200;
 const SERIAL_PORT_BUFFER_SIZE = 8 * 1024 * 1024;
 const OUTBOX_MAX_IN_FLIGHT = 64;
@@ -462,6 +461,15 @@ function isPreferredChineseVoice(voice) {
 }
 
 export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = false, audience = false, initialTab = "pilots" }) {
+  const nativeCollectorMode = !audience && (() => {
+    const mode = new URLSearchParams(window.location.search).get("nativeCollector");
+    if (mode === "1") {
+      window.localStorage.setItem("fpv-native-collector", "1");
+    } else if (mode === "0") {
+      window.localStorage.removeItem("fpv-native-collector");
+    }
+    return window.localStorage.getItem("fpv-native-collector") === "1";
+  })();
   const [tab, setTab] = useState(initialTab);
   const [pilots, setPilots] = useState([]);
   const [events, setEvents] = useState([]);
@@ -1032,7 +1040,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       if (!lastDataAt || Date.now() - lastDataAt > 1500) {
         setSerialInputFps(0);
         serialInputFpsRef.current = { count: 0, startedAt: 0 };
-        if (serialStateRef.current?.portName === "虚拟测试阵列" && lastDataAt) {
+        if (["虚拟测试阵列", "Windows 托盘采集程序"].includes(serialStateRef.current?.portName) && lastDataAt) {
           serialLatestRef.current = {};
           serialSamplesRef.current = {};
           setSerialState((current) => ({
@@ -1220,9 +1228,13 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       const descriptor = await rememberTrainingSerialPort(port) || describeSerialPort(port, ports);
       try {
         await requestSerialWorker("open", { descriptor });
+        await requestSerialWorker("configure_live", { url: getLiveSocketUrl(), room: LIVE_ROOM_ID });
         serialTransportRef.current = "worker";
       } catch (workerError) {
-        if (workerError.code !== "worker_serial_unsupported") throw workerError;
+        if (workerError.code !== "worker_serial_unsupported") {
+          try { await requestSerialWorker("close"); } catch { /* Worker may have exited. */ }
+          throw workerError;
+        }
         // Older Chromium builds may expose Web Serial only on Window. Keep a
         // compatibility path, but supported production browsers use Worker so
         // page rendering and background timer throttling cannot stop reads.
@@ -1710,7 +1722,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       // When queued messages finally reach this page, never fast-play those
       // old stick positions as current live control. Selected 5 Hz snapshots
       // below are cached and explicitly replayed as historical backfill.
-      if (!historicalCapture && socket?.readyState === 1 && socket.bufferedAmount <= 256 * 1024) {
+      if (serialTransportRef.current !== "worker" && !historicalCapture && socket?.readyState === 1 && socket.bufferedAmount <= 256 * 1024) {
         socket.send(JSON.stringify({
           type: "live_batch",
           room: LIVE_ROOM_ID,
@@ -1753,6 +1765,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
         eventId: activeEventId,
         liveOnly: true,
         durable: true,
+        ...(serialTransportRef.current === "worker" ? { persistOnly: true } : {}),
       };
       const historicalOutgoing = {
         type: "live_batch",
@@ -2129,14 +2142,16 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
             });
           }
         }
-        if (!audience && message.type === "live_batch" && message.source === "virtual_receiver" && message.batch) {
+        if (!audience && message.type === "live_batch"
+          && (message.source === "virtual_receiver" || (nativeCollectorMode && message.source === "native_collector"))
+          && message.batch) {
           const capturedAt = message.sampleTime || message.serverTime || Date.now();
           setSerialState((current) => ({
             ...current,
             supported: true,
             connected: true,
             connecting: false,
-            portName: "虚拟测试阵列",
+            portName: message.source === "native_collector" ? "Windows 托盘采集程序" : "虚拟测试阵列",
             baudRate: 115200,
             error: "",
           }));
@@ -2269,10 +2284,10 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
       liveSocketRef.current?.close();
       liveSocketRef.current = null;
     };
-  }, [audience, queueAcknowledgedOutboxDelete, requestSerialRender, scheduleOutboxFlush, updateSerialFromPacket]);
+  }, [audience, nativeCollectorMode, queueAcknowledgedOutboxDelete, requestSerialRender, scheduleOutboxFlush, updateSerialFromPacket]);
 
   useEffect(() => {
-    if (audience || !navigator.serial) return undefined;
+    if (audience || nativeCollectorMode || !navigator.serial) return undefined;
     let stopped = false;
 
     function scheduleAutoConnect(delayMs = 0) {
@@ -2352,7 +2367,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
     };
   // Serial listeners are registered once per page mode; helpers read current values from refs.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [audience]);
+  }, [audience, nativeCollectorMode]);
 
   async function readSerialLoop(port) {
     const decoder = new TextDecoder();
@@ -2409,6 +2424,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
   }
 
   async function connectSerialArray() {
+    if (nativeCollectorMode) return;
     if (!navigator.serial) {
       pushStatus("当前浏览器不支持 Web Serial，请使用 Edge/Chrome 的 localhost 或 HTTPS 页面");
       setSerialState((current) => ({ ...current, supported: false, error: "当前浏览器不支持 Web Serial，请使用 Edge/Chrome 的 localhost 或 HTTPS 页面" }));
@@ -2430,6 +2446,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
   }
 
   async function disconnectSerialArray() {
+    if (nativeCollectorMode) return;
     manualSerialDisconnectRef.current = true;
     if (serialReconnectTimerRef.current) window.clearTimeout(serialReconnectTimerRef.current);
     await releaseSerialResources({ clear: true });
@@ -2446,6 +2463,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
   }
 
   async function bindSerialReceiver(receiverId = 1) {
+    if (nativeCollectorMode) throw new Error(`请在 Windows 托盘程序中执行接收机 ${receiverId} 绑定`);
     if (serialStateRef.current?.portName === "虚拟测试阵列") {
       setSerialState((current) => ({ ...current, error: "", lastCommand: `BIND:${receiverId}（测试模拟）` }));
       return;
@@ -2961,7 +2979,7 @@ export default function TrainingSystem({ onBack, onOpenBracket, bracketLive = fa
 
       {tab === "skill-tree" && <SkillTreePage />}
       {tab === "pilots" && <PilotLibraryPage key={pilots.map((pilot) => `${pilot.id}:${pilot.updatedAt || ""}:${pilot.name}`).join("|")} pilots={pilots} onSave={savePilots} />}
-      {tab === "events" && <EventPage pilots={pilots} events={events} live={displayLive} serialState={serialState} serialPower={serialState.power} onConnectSerial={connectSerialArray} onDisconnectSerial={disconnectSerialArray} onSaveEvents={saveEvents} onBindReceiver={async (id) => {
+      {tab === "events" && <EventPage pilots={pilots} events={events} live={displayLive} serialState={serialState} serialPower={serialState.power} externalCollector={nativeCollectorMode} onConnectSerial={connectSerialArray} onDisconnectSerial={disconnectSerialArray} onSaveEvents={saveEvents} onBindReceiver={async (id) => {
         try {
           if (serialState.connected) await bindSerialReceiver(id);
           try {

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:">
+  <title>FPV 训练采集</title>
+  <link rel="stylesheet" href="./dashboard.css">
+  <script src="./dashboard.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="header">
+      <div class="brand"><div class="brand-mark">FPV</div><div><h1>训练采集</h1><p>接收阵列与云端实时状态</p></div></div>
+      <div class="header-right"><span id="clock" class="clock">--:--:--</span><span id="global-indicator" class="live-pill"><span class="pulse-dot"></span><span>等待实时链路</span></span></div>
+    </header>
+
+    <section class="control-card" aria-label="串口与操作">
+      <div class="section-heading"><div><h2>串口与操作</h2><p>先选设备，再点击连接。相同 STM32 芯片的飞控不会自动接入。</p></div><button id="open-coach" class="button button-outline" type="button">打开教练网页 ↗</button></div>
+      <div class="port-row"><label class="field"><span>接收阵列串口</span><select id="port-select"><option value="">请选择接收阵列串口</option></select></label><button id="connect-port" class="button" type="button">连接</button><button id="disconnect-port" class="button button-quiet" type="button">断开</button></div>
+      <p id="action-message" class="hint">关闭或最小化窗口后，已连接的托盘采集继续运行。</p>
+    </section>
+
+    <section class="status-row" aria-label="连接状态">
+      <div class="status-item"><span id="serial-dot" class="status-dot"></span><div><small>本机接收阵列</small><strong id="serial-state">等待选择串口</strong><span id="active-port">未连接</span></div></div>
+      <div class="status-item"><span id="server-dot" class="status-dot"></span><div><small>云端实时链路</small><strong id="server-state">正在连接</strong><span id="server-detail">等待 WebSocket</span></div></div>
+      <div class="status-item"><span id="event-dot" class="status-dot"></span><div><small>当前训练事件</small><strong id="event-state">暂无活动事件</strong><span>接收机名称跟随当前事件</span></div></div>
+    </section>
+
+    <section class="receiver-section">
+      <div class="section-heading"><div><h2>接收机节点状态</h2><p>每台接收机单独显示状态与对频操作。</p></div><span id="receiver-count" class="count-badge">0 台</span></div>
+      <div id="receiver-empty" class="empty">当前没有接收机数据。连接串口并开始训练后，这里会显示对应飞手。</div>
+      <div id="receiver-grid" class="receiver-grid"></div>
+    </section>
+
+    <section class="metrics" aria-label="实时指标">
+      <div class="metric"><span>串口接收</span><strong><span id="input-fps">0</span><small>帧/秒</small></strong><div id="fps-bars" class="spark" aria-hidden="true"></div></div>
+      <div class="metric"><span>累计原始帧</span><strong id="frames-read">0</strong><p id="last-frame">尚无数据</p></div>
+      <div class="metric"><span>实时已发</span><strong id="live-sent">0</strong><p id="last-live">尚未发送</p></div>
+      <div class="metric"><span>本机可靠缓存</span><strong id="cached-packets">0</strong><p id="last-ack">等待 ACK</p></div>
+    </section>
+
+    <div id="error-banner" class="error-banner" hidden></div>
+    <footer>此窗口显示当前原始接收数据；飞行状态、条带与历史统计以云端服务器为准。</footer>
+  </main>
+</body>
+</html>

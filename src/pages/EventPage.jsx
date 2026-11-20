@@ -1,5 +1,6 @@
 ﻿import { useEffect, useMemo, useRef, useState } from "react";
 import { apiPost, buttonStyle, dangerButtonStyle, inputStyle, panelStyle, primaryButtonStyle, videoChannels } from "../trainingShared.js";
+import { availableVideoNumbers, duplicateVideoChannel } from "../eventFrequency.js";
 import { getCoachPassword, setCoachPassword, validateCoachPassword } from "../authConfig.js";
 
 const lessonActionOptions = ["讲解", "观察", "修正", "验收"];
@@ -61,8 +62,8 @@ function makeParticipant(pilot, index) {
   return {
     pilotId: pilot?.id || "",
     receiverId: index + 1,
-    videoBand: "L",
-    videoChannel: "L1",
+    videoBand: "",
+    videoChannel: "",
     trainingStartAt: null,
     trainingEndAt: null,
   };
@@ -83,12 +84,6 @@ function makeEvent() {
 }
 
 const videoBandOptions = Array.from(new Set(videoChannels.all.map((channel) => channel[0])));
-
-function getVideoNumbers(band) {
-  return videoChannels.all
-    .filter((channel) => channel[0] === band)
-    .map((channel) => channel.slice(1));
-}
 
 function formatDateTimeLocal(ms) {
   if (!ms) return "";
@@ -528,7 +523,8 @@ function openPrintPage(title, body) {
 }
 
 function participantFrequencyText(participant) {
-  return participant.videoChannel || `${participant.videoBand || ""}${participant.videoNumber || ""}` || "";
+  if (participant.videoChannel) return participant.videoChannel;
+  return participant.videoBand && participant.videoNumber ? `${participant.videoBand}${participant.videoNumber}` : "";
 }
 
 function participantLabel(participant) {
@@ -1303,7 +1299,7 @@ function LessonPlanPanel({ event }) {
   );
 }
 
-function ReceiverArrayPanel({ serialState, onConnectSerial, onDisconnectSerial }) {
+function ReceiverArrayPanel({ serialState, externalCollector, onConnectSerial, onDisconnectSerial }) {
   const identifiedCount = serialState.connected ? serialState.maxReceiverId || 0 : 0;
   const onlineCount = serialState.connected ? serialState.receiverCount || 0 : 0;
   const infoBoxStyle = {
@@ -1331,10 +1327,12 @@ function ReceiverArrayPanel({ serialState, onConnectSerial, onDisconnectSerial }
           <h2 style={{ margin: 0, fontWeight: 900, textAlign: "left" }}>接收阵列</h2>
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button type="button" style={primaryButtonStyle} onClick={onConnectSerial} disabled={serialState.connecting || serialState.connected || !serialState.supported}>
-            {serialState.connecting ? "连接中..." : "连接阵列"}
-          </button>
-          {serialState.connected && <button type="button" style={dangerButtonStyle} onClick={onDisconnectSerial}>断开阵列</button>}
+          {externalCollector ? <span>串口由 Windows 托盘程序管理</span> : <>
+            <button type="button" style={primaryButtonStyle} onClick={onConnectSerial} disabled={serialState.connecting || serialState.connected || !serialState.supported}>
+              {serialState.connecting ? "连接中..." : "连接阵列"}
+            </button>
+            {serialState.connected && <button type="button" style={dangerButtonStyle} onClick={onDisconnectSerial}>断开阵列</button>}
+          </>}
         </div>
       </div>
 
@@ -1371,8 +1369,13 @@ function ReceiverArrayPanel({ serialState, onConnectSerial, onDisconnectSerial }
   );
 }
 
-function ReceiverStatus({ receivers, onBindReceiver }) {
+function ReceiverStatus({ receivers, participants, pilots, externalCollector, onBindReceiver }) {
   const [bindingId, setBindingId] = useState(null);
+  const pilotById = new Map((pilots || []).map((pilot) => [pilot.id, pilot.name]));
+  const participantByReceiver = new Map((participants || []).map((participant) => [Number(participant.receiverId), participant]));
+  const receiverById = new Map((receivers || []).map((receiver) => [Number(receiver.id), receiver]));
+  const receiverIds = [...new Set([...participantByReceiver.keys(), ...receiverById.keys()])]
+    .filter((id) => Number.isInteger(id) && id > 0).sort((left, right) => left - right);
 
   async function bindReceiver(id) {
     setBindingId(id);
@@ -1386,16 +1389,21 @@ function ReceiverStatus({ receivers, onBindReceiver }) {
   return (
     <section style={panelStyle}>
       <h2 style={{ margin: "0 0 12px", fontWeight: 900, textAlign: "left" }}>接收机节点状态</h2>
-      {(!receivers || receivers.length === 0) && (
+      {receiverIds.length === 0 && (
         <div style={{ color: "#64748b", fontSize: 13 }}>还未从串口识别到接收机。</div>
       )}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(190px,1fr))", gap: 10 }}>
-        {(receivers || []).map((receiver) => (
+        {receiverIds.map((id) => {
+          const receiver = receiverById.get(id) || { id, online: false, paired: false };
+          const participant = participantByReceiver.get(id);
+          const pilotName = pilotById.get(participant?.pilotId) || participant?.pilotId || receiver.name || "未分配飞手";
+          return (
           <div key={receiver.id} style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12, background: receiver.online ? "#f0fdf4" : "#f8fafc" }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
-              <strong>{receiver.name || `接收机 ${receiver.id}`}</strong>
+              <strong>{pilotName}</strong>
               <span style={{ color: receiver.online ? "#047857" : "#64748b", fontSize: 13 }}>{receiver.online ? "在线" : "离线"}</span>
             </div>
+            <div style={{ color: "#64748b", fontSize: 12, marginTop: 4 }}>接收机 RX {receiver.id}</div>
             <div style={{ color: !receiver.online ? "#64748b" : receiver.paired ? "#047857" : "#b45309", fontSize: 12, marginTop: 6 }}>
               {!receiver.online ? "离线" : receiver.paired ? "已对频" : "未对频"}
             </div>
@@ -1405,11 +1413,13 @@ function ReceiverStatus({ receivers, onBindReceiver }) {
             <div style={{ color: "#64748b", fontSize: 12, marginTop: 4 }}>
               最后数据：{formatSerialTime(receiver.lastSeenAt)}
             </div>
-            <button type="button" style={{ ...buttonStyle, marginTop: 10, width: "100%" }} onClick={() => bindReceiver(receiver.id)} disabled={bindingId === receiver.id}>
-              {bindingId === receiver.id ? "发送中..." : "对频"}
-            </button>
+            {externalCollector ? <div style={{ marginTop: 10, fontSize: 12, color: "#64748b" }}>请在 Windows 托盘程序中对频</div>
+              : <button type="button" style={{ ...buttonStyle, marginTop: 10, width: "100%" }} onClick={() => bindReceiver(receiver.id)} disabled={bindingId === receiver.id}>
+                {bindingId === receiver.id ? "发送中..." : "对频"}
+              </button>}
           </div>
-        ))}
+          );
+        })}
       </div>
     </section>
   );
@@ -1455,11 +1465,17 @@ function ReceiverPowerPanel({ power }) {
   );
 }
 
-export default function EventPage({ pilots, events, live, serialState, serialPower, onConnectSerial, onDisconnectSerial, onSaveEvents, onBindReceiver }) {
+export default function EventPage({ pilots, events, live, serialState, serialPower, externalCollector = false, onConnectSerial, onDisconnectSerial, onSaveEvents, onBindReceiver }) {
   const activeEvent = events.find((event) => event.active);
   const [draftEvent, setDraftEvent] = useState(activeEvent || events[0] || makeEvent());
+  const initialSelectionResolvedRef = useRef(Boolean(activeEvent || events[0]));
   const [busyText, setBusyText] = useState("");
   const currentEvent = draftEvent;
+  useEffect(() => {
+    if (initialSelectionResolvedRef.current || !events.length) return;
+    initialSelectionResolvedRef.current = true;
+    setDraftEvent((current) => current.name || current.participants.length ? current : activeEvent || events[0]);
+  }, [activeEvent, events]);
   const receiverIds = useMemo(() => {
     const count = Math.max(16, Number(serialState.maxReceiverId || serialState.receiverCount || 0));
     const ids = new Set(Array.from({ length: count }, (_, index) => index + 1));
@@ -1470,7 +1486,9 @@ export default function EventPage({ pilots, events, live, serialState, serialPow
   function getDuplicateName(event) {
     const name = event.name.trim();
     if (!name) return "训练名称不能为空";
-    return events.some((item) => item.id !== event.id && item.name.trim() === name) ? `已经存在同名训练事件：${name}` : "";
+    if (events.some((item) => item.id !== event.id && item.name.trim() === name)) return `已经存在同名训练事件：${name}`;
+    const duplicateChannel = duplicateVideoChannel(event.participants || []);
+    return duplicateChannel ? `图传频点 ${duplicateChannel} 已分配给其他飞手` : "";
   }
 
   async function saveDraft(event = currentEvent) {
@@ -1533,13 +1551,13 @@ export default function EventPage({ pilots, events, live, serialState, serialPow
   }
 
   function updateVideoBand(index, videoBand) {
-    const firstNumber = getVideoNumbers(videoBand)[0] || "1";
-    updateParticipant(index, { videoBand, videoChannel: `${videoBand}${firstNumber}` });
+    updateParticipant(index, { videoBand, videoChannel: "" });
   }
 
   function updateVideoNumber(index, number) {
-    const videoBand = currentEvent.participants[index]?.videoBand || currentEvent.participants[index]?.videoChannel?.[0] || "L";
-    updateParticipant(index, { videoBand, videoChannel: `${videoBand}${number}` });
+    const videoBand = currentEvent.participants[index]?.videoBand || currentEvent.participants[index]?.videoChannel?.[0] || "";
+    const videoChannel = videoBand && number ? `${videoBand}${number}` : "";
+    updateParticipant(index, { videoBand, videoChannel });
   }
 
   function createNewEvent() {
@@ -1548,6 +1566,7 @@ export default function EventPage({ pilots, events, live, serialState, serialPow
       return;
     }
     const nextEvent = makeEvent();
+    initialSelectionResolvedRef.current = true;
     setDraftEvent(nextEvent);
     setBusyText("已新建初始配置，请填写训练名称后保存配置");
   }
@@ -1606,7 +1625,7 @@ export default function EventPage({ pilots, events, live, serialState, serialPow
           <div>
             <h2 style={{ margin: 0, fontWeight: 900, textAlign: "left" }}>事件和系统</h2>
             <div style={{ color: "#64748b", fontSize: 13, marginTop: 6 }}>初始配置 → 保存配置 → 空闲 → 开始记录 → 记录中。</div>
-            {busyText && <div style={{ color: busyText.includes("失败") || busyText.includes("存在") || busyText.includes("不能为空") ? "#b91c1c" : "#047857", fontSize: 13, marginTop: 6 }}>{busyText}</div>}
+            {busyText && <div style={{ color: busyText.includes("失败") || busyText.includes("存在") || busyText.includes("不能为空") || busyText.includes("已分配") ? "#b91c1c" : "#047857", fontSize: 13, marginTop: 6 }}>{busyText}</div>}
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button type="button" style={buttonStyle} onClick={createNewEvent} disabled={events.some((event) => event.active)}>新建事件</button>
@@ -1617,6 +1636,25 @@ export default function EventPage({ pilots, events, live, serialState, serialPow
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "minmax(260px,1fr) 180px", gap: 10, marginTop: 14 }}>
+          <label style={{ gridColumn: "1 / -1" }}>
+            <div style={{ fontSize: 13, marginBottom: 6 }}>选择训练事件</div>
+            <select
+              aria-label="选择训练事件"
+              value={events.some((event) => event.id === currentEvent.id) ? currentEvent.id : ""}
+              onChange={(e) => {
+                const selected = events.find((event) => event.id === e.target.value);
+                if (!selected) return;
+                setDraftEvent(selected);
+                setBusyText(`已选择 ${selected.name}，可编辑配置或开始记录`);
+              }}
+              style={inputStyle}
+            >
+              <option value="">{events.length ? "选择已有训练事件" : "暂无已保存的训练事件"}</option>
+              {events.map((event) => (
+                <option key={event.id} value={event.id}>{event.name || "未命名事件"}{event.active ? " · 记录中" : event.startedAt ? " · 可继续记录" : " · 未开始"}</option>
+              ))}
+            </select>
+          </label>
           <label>
             <div style={{ fontSize: 13, marginBottom: 6 }}>训练名称</div>
             <input value={currentEvent.name} onChange={(e) => setDraftEvent({ ...currentEvent, name: e.target.value })} style={{ ...inputStyle, fontSize: 14 }} />
@@ -1634,6 +1672,7 @@ export default function EventPage({ pilots, events, live, serialState, serialPow
 
       <ReceiverArrayPanel
         serialState={serialState}
+        externalCollector={externalCollector}
         onConnectSerial={onConnectSerial}
         onDisconnectSerial={onDisconnectSerial}
       />
@@ -1656,11 +1695,13 @@ export default function EventPage({ pilots, events, live, serialState, serialPow
               <select value={participant.receiverId} onChange={(e) => updateParticipant(index, { receiverId: Number(e.target.value) })} style={inputStyle}>
                 {receiverIds.map((receiverId) => <option key={receiverId} value={receiverId}>接收机 {receiverId}</option>)}
               </select>
-              <select value={participant.videoBand || participant.videoChannel?.[0] || "L"} onChange={(e) => updateVideoBand(index, e.target.value)} style={inputStyle}>
+              <select aria-label={`飞手 ${index + 1} 图传频段`} value={participant.videoBand || participant.videoChannel?.[0] || ""} onChange={(e) => updateVideoBand(index, e.target.value)} style={inputStyle}>
+                <option value="">选择频段</option>
                 {videoBandOptions.map((band) => <option key={band} value={band}>{band}</option>)}
               </select>
-              <select value={(participant.videoChannel || "L1").slice(1)} onChange={(e) => updateVideoNumber(index, e.target.value)} style={inputStyle}>
-                {getVideoNumbers(participant.videoBand || participant.videoChannel?.[0] || "L").map((number) => <option key={number} value={number}>{number}</option>)}
+              <select aria-label={`飞手 ${index + 1} 图传频道`} value={participant.videoChannel ? participant.videoChannel.slice(1) : ""} onChange={(e) => updateVideoNumber(index, e.target.value)} style={inputStyle} disabled={!participant.videoBand && !participant.videoChannel}>
+                <option value="">选择频道</option>
+                {availableVideoNumbers(videoChannels.all, currentEvent.participants, index, participant.videoBand || participant.videoChannel?.[0] || "").map((number) => <option key={number} value={number}>{number}</option>)}
               </select>
               <label style={{ minWidth: 0 }}>
                 <div style={{ color: "#64748b", fontSize: 12, marginBottom: 4 }}>有效开始</div>
@@ -1686,7 +1727,7 @@ export default function EventPage({ pilots, events, live, serialState, serialPow
         </div>
       </section>
 
-      <ReceiverStatus receivers={live.receivers} onBindReceiver={onBindReceiver} />
+      <ReceiverStatus receivers={live.receivers} participants={(activeEvent || currentEvent).participants} pilots={pilots} externalCollector={externalCollector} onBindReceiver={onBindReceiver} />
       <ReceiverPowerPanel power={serialPower || serialState.power} />
     </div>
   );

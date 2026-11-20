@@ -2,11 +2,88 @@ import { createSerialCaptureClock } from "./serialCaptureClock.js";
 import { consumeSerialJsonStream } from "./serialJsonStream.js";
 
 const SERIAL_PORT_BUFFER_SIZE = 8 * 1024 * 1024;
+const LIVE_RECONNECT_MS = 2000;
+const LIVE_MAX_BUFFERED_BYTES = 256 * 1024;
+const LIVE_STALE_FRAME_MS = 3000;
 
 let activePort = null;
 let activeReader = null;
 let keepReading = false;
 let commandChain = Promise.resolve();
+let liveSocket = null;
+let liveSocketUrl = "";
+let liveRoom = "default";
+let liveReconnectTimer = null;
+
+function clearLiveReconnect() {
+  if (liveReconnectTimer !== null) clearTimeout(liveReconnectTimer);
+  liveReconnectTimer = null;
+}
+
+function connectLiveSocket() {
+  if (!liveSocketUrl || !keepReading || !activePort) return;
+  if (liveSocket && (liveSocket.readyState === WebSocket.OPEN || liveSocket.readyState === WebSocket.CONNECTING)) return;
+  clearLiveReconnect();
+  const socket = new WebSocket(liveSocketUrl);
+  liveSocket = socket;
+  socket.addEventListener("open", () => {
+    if (liveSocket !== socket || !keepReading) return;
+    socket.send(JSON.stringify({ type: "publish_live", room: liveRoom }));
+  });
+  socket.addEventListener("close", () => {
+    if (liveSocket !== socket) return;
+    liveSocket = null;
+    if (keepReading && activePort && liveSocketUrl) {
+      liveReconnectTimer = setTimeout(connectLiveSocket, LIVE_RECONNECT_MS);
+    }
+  });
+  socket.addEventListener("error", () => {
+    // close schedules a bounded retry; serial reading must continue.
+  });
+}
+
+function closeLiveSocket() {
+  clearLiveReconnect();
+  liveSocketUrl = "";
+  const socket = liveSocket;
+  liveSocket = null;
+  socket?.close();
+}
+
+function compactLivePacket(packet) {
+  const compactItem = (item) => {
+    const result = { rx: Number(item?.rx), ch: Array.isArray(item?.ch) ? item.ch.slice(0, 8).map(Number) : [] };
+    for (const [key, value] of [["lq", item?.lq ?? item?.linkQuality], ["rssi", item?.rssi], ["t", item?.t]]) {
+      if (value !== undefined && value !== null && Number.isFinite(Number(value))) result[key] = Number(value);
+    }
+    return result;
+  };
+  if (packet?.type === "rx_batch" && Array.isArray(packet.items)) {
+    const result = {
+      type: "rx_batch",
+      v: Number(packet.v) || 1,
+      items: packet.items.map(compactItem).filter((item) => Number.isFinite(item.rx) && item.ch.length >= 8),
+    };
+    if (Number.isFinite(Number(packet.t))) result.t = Number(packet.t);
+    return result;
+  }
+  return compactItem(packet);
+}
+
+function publishWorkerLive(packet, capturedAt) {
+  const socket = liveSocket;
+  // Buffered serial bytes retain their original capture time and must never
+  // fast-play as current sticks after the Worker itself resumes.
+  if (Date.now() - capturedAt >= LIVE_STALE_FRAME_MS) return;
+  if (!socket || socket.readyState !== WebSocket.OPEN || socket.bufferedAmount > LIVE_MAX_BUFFERED_BYTES) return;
+  socket.send(JSON.stringify({
+    type: "live_batch",
+    room: liveRoom,
+    batch: compactLivePacket(packet),
+    clientTime: capturedAt,
+    liveOnly: true,
+  }));
+}
 
 function portDescriptor(port, ports) {
   const info = port?.getInfo?.() || {};
@@ -46,6 +123,7 @@ function respond(requestId, result = {}, error = null) {
 
 async function closePort() {
   keepReading = false;
+  closeLiveSocket();
   const reader = activeReader;
   const port = activePort;
   activeReader = null;
@@ -90,6 +168,7 @@ async function readPort(port) {
           line,
           capturedAt: captureClock.capture(packet, Date.now()),
         }));
+        for (const frame of frames) publishWorkerLive(frame.packet, frame.capturedAt);
         if (frames.length || consumed.failures.length) {
           self.postMessage({
             type: "serial_frames",
@@ -115,6 +194,7 @@ async function readPort(port) {
 
   if (keepReading && activePort === port) {
     keepReading = false;
+    closeLiveSocket();
     self.postMessage({ type: "serial_disconnected", error: "串口已断开，正在自动重连" });
   }
 }
@@ -152,6 +232,13 @@ self.addEventListener("message", (event) => {
     if (message.type === "open") {
       const result = await openPort(message.descriptor);
       respond(message.requestId, result);
+      return;
+    }
+    if (message.type === "configure_live") {
+      liveSocketUrl = String(message.url || "");
+      liveRoom = String(message.room || "default");
+      connectLiveSocket();
+      respond(message.requestId, { configured: true });
       return;
     }
     if (message.type === "close") {

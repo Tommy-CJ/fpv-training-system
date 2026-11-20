@@ -77,6 +77,98 @@ function MiniWaveform({ samples, segments, eventStart, eventEnd }) {
   );
 }
 
+function OverviewStrip({ segments, eventStart, eventEnd }) {
+  const width = 760;
+  const height = 44;
+  const start = eventStart || segments?.[0]?.startedAt || eventEnd || 0;
+  const end = Math.max(start + 1, eventEnd || segments?.[segments.length - 1]?.endedAt || start + 1);
+  const colorByState = { turtle: "#fb923c", flight: "#34d399", idle: "#e2e8f0" };
+
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      width="100%"
+      height="44"
+      preserveAspectRatio="none"
+      aria-label="训练状态条带"
+      style={{ display: "block", borderRadius: 8, background: "#f8fafc", border: "1px solid #e2e8f0" }}
+    >
+      {(segments || []).map((segment, index) => {
+        const segmentStart = Math.max(start, segment.startedAt);
+        const segmentEnd = Math.min(end, segment.endedAt);
+        if (segmentEnd <= segmentStart) return null;
+        const x = ((segmentStart - start) / Math.max(1, end - start)) * width;
+        const segmentWidth = Math.max(1, ((segmentEnd - segmentStart) / Math.max(1, end - start)) * width);
+        return <rect key={`${segment.type}-${index}`} x={x} y="0" width={segmentWidth} height={height} fill={colorByState[segment.type] || colorByState.idle} />;
+      })}
+    </svg>
+  );
+}
+
+function ParentOverviewCard({ detail, onClose }) {
+  const event = detail?.event || {};
+  const rankedParticipants = [...(detail?.participants || [])].sort((left, right) => (
+    Number(right.totalFlightMs || 0) - Number(left.totalFlightMs || 0)
+    || Number(right.utilization || 0) - Number(left.utilization || 0)
+    || String(left.pilotName || "").localeCompare(String(right.pilotName || ""), "zh-CN")
+  ));
+  const eventStart = event.startedAt || event.createdAt;
+  const eventEnd = event.endedAt || detail?.generatedAt;
+
+  return (
+    <div
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      style={{ position: "fixed", inset: 0, zIndex: 50, padding: 16, background: "rgba(15, 23, 42, .62)", display: "grid", placeItems: "center" }}
+    >
+      <section
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="parent-overview-title"
+        style={{ width: "min(1180px, 100%)", maxHeight: "calc(100vh - 32px)", overflow: "auto", borderRadius: 22, background: "#f8fafc", boxShadow: "0 24px 70px rgba(15, 23, 42, .28)", padding: "clamp(18px, 3vw, 34px)", color: "#0f172a" }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "flex-start", marginBottom: 20 }}>
+          <div>
+            <div style={{ color: "#2563eb", fontWeight: 900, letterSpacing: ".08em", fontSize: 12 }}>FPV TRAINING</div>
+            <h2 id="parent-overview-title" style={{ margin: "5px 0 7px", fontSize: "clamp(24px, 4vw, 34px)", lineHeight: 1.15 }}>训练总览</h2>
+            <div style={{ color: "#475569", fontSize: 14 }}>{event.name || "训练事件"} · {formatDateTime(eventStart)}</div>
+          </div>
+          <button type="button" aria-label="关闭家长展示总览" style={{ ...buttonStyle, flex: "0 0 auto" }} onClick={onClose}>关闭</button>
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center", padding: "12px 14px", borderRadius: 14, background: "#e0f2fe", color: "#0c4a6e", marginBottom: 20 }}>
+          <strong>{rankedParticipants.length} 位飞手</strong>
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", fontSize: 13 }}>
+            <span><i style={{ display: "inline-block", width: 9, height: 9, borderRadius: 99, background: "#34d399", marginRight: 4 }} />飞行</span>
+            <span><i style={{ display: "inline-block", width: 9, height: 9, borderRadius: 99, background: "#fb923c", marginRight: 4 }} />反乌龟</span>
+            <span><i style={{ display: "inline-block", width: 9, height: 9, borderRadius: 99, background: "#cbd5e1", marginRight: 4 }} />待机</span>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(460px, 1fr))", gap: 14 }}>
+          {rankedParticipants.map((participant, index) => (
+            <article key={`${participant.pilotId}-${participant.receiverId}`} style={{ border: "1px solid #dbeafe", borderRadius: 16, padding: 15, background: "#fff", display: "grid", gap: 12 }}>
+              <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 10 }}>
+                <strong style={{ fontSize: 18, overflowWrap: "anywhere" }}>{participant.pilotName || "未命名飞手"}</strong>
+                <span style={{ flex: "0 0 auto", color: "#2563eb", fontWeight: 900, fontSize: 13 }}>第 {index + 1} 名</span>
+              </div>
+              <OverviewStrip segments={participant.segments} eventStart={eventStart} eventEnd={eventEnd} />
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                <div style={{ flex: "1 1 180px" }}><div style={{ color: "#64748b", fontSize: 12 }}>飞行时长</div><strong style={{ whiteSpace: "nowrap" }}>{formatDuration(participant.totalFlightMs || 0)}</strong></div>
+                <div style={{ flex: "1 1 102px" }}><div style={{ color: "#64748b", fontSize: 12 }}>利用率</div><strong style={{ whiteSpace: "nowrap" }}>{Math.round(Number(participant.utilization || 0) * 100)}%</strong></div>
+                <div style={{ flex: "1 1 140px" }}><div style={{ color: "#64748b", fontSize: 12 }}>反乌龟</div><strong style={{ whiteSpace: "nowrap" }}>{formatDuration(participant.totalTurtleMs || 0)}</strong></div>
+              </div>
+            </article>
+          ))}
+        </div>
+        {!rankedParticipants.length && <div style={{ padding: 24, color: "#64748b", textAlign: "center" }}>本次训练暂无飞手统计。</div>}
+      </section>
+    </div>
+  );
+}
+
 function TaskSummary({ tasks }) {
   const completion = taskCompletion(tasks);
   return (
@@ -155,6 +247,7 @@ export default function HistoryPage({ events, onDeleteEvent, onEventUpdated }) {
   const [aiSummary, setAiSummary] = useState(null);
   const [trimEndText, setTrimEndText] = useState("");
   const [trimEditingId, setTrimEditingId] = useState("");
+  const [parentOverviewOpen, setParentOverviewOpen] = useState(false);
   const activeSelectedId = selectedId || finishedEvents[0]?.id || "";
 
   const loadDetail = useCallback(async (eventId = activeSelectedId) => {
@@ -184,6 +277,15 @@ export default function HistoryPage({ events, onDeleteEvent, onEventUpdated }) {
       stopped = true;
     };
   }, [activeSelectedId, loadDetail]);
+
+  useEffect(() => {
+    if (!parentOverviewOpen) return undefined;
+    function closeOnEscape(event) {
+      if (event.key === "Escape") setParentOverviewOpen(false);
+    }
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [parentOverviewOpen]);
 
   async function deleteEvent(eventId) {
     const event = finishedEvents.find((item) => item.id === eventId);
@@ -323,6 +425,14 @@ export default function HistoryPage({ events, onDeleteEvent, onEventUpdated }) {
               <div><strong>任务完成</strong><div>{completion.done}/{completion.total} · {completion.pct}%</div></div>
             </div>
 
+            <div style={{ border: "1px solid #bfdbfe", borderRadius: 12, padding: 12, background: "#eff6ff", display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+              <div>
+                <strong style={{ color: "#0f172a" }}>家长展示总览</strong>
+                <div style={{ color: "#475569", fontSize: 13, marginTop: 3 }}>集中展示每位飞手的条带、排名和客观训练数据，不含评语或 AI 总结。</div>
+              </div>
+              <button type="button" style={primaryButtonStyle} onClick={() => setParentOverviewOpen(true)}>打开总览卡片</button>
+            </div>
+
             <div style={{ border: "1px solid #e2e8f0", borderRadius: 12, padding: 12, background: "#fff", display: "grid", gap: 10 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
                 <strong>AI 总结配置</strong>
@@ -384,6 +494,7 @@ export default function HistoryPage({ events, onDeleteEvent, onEventUpdated }) {
           </div>
         )}
       </section>
+      {parentOverviewOpen && detail && <ParentOverviewCard detail={detail} onClose={() => setParentOverviewOpen(false)} />}
     </div>
   );
 }

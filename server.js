@@ -561,8 +561,8 @@ function broadcastLiveBatch(roomId, batch, serverTime, sampleTime = serverTime, 
   for (const subscriber of subscribers) {
     queueSubscriberFrame(subscriber, frame, "live");
   }
-  if (source === "virtual_receiver") {
-    const publisherOutgoing = { ...outgoing, source: "virtual_receiver" };
+  if (source === "virtual_receiver" || source === "native_collector") {
+    const publisherOutgoing = { ...outgoing, source };
     for (const publisher of room.publishers) {
       if (publisher.socket.destroyed) continue;
       sendLiveSocketJson(publisher, publisherOutgoing);

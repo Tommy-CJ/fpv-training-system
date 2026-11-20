@@ -1,0 +1,20 @@
+{
+  "name": "fpv-training-collector",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "main.cjs",
+  "scripts": {
+    "sync:shared": "node scripts/sync-shared.mjs",
+    "start": "npm run sync:shared && electron .",
+    "verify": "npm run sync:shared && node scripts/verify-collector.mjs && node scripts/verify-offline-recovery.mjs",
+    "package:win": "npm run sync:shared && node scripts/package-win.mjs"
+  },
+  "dependencies": {
+    "serialport": "13.0.0"
+  },
+  "devDependencies": {
+    "@electron/packager": "^18.4.0",
+    "electron": "44.4.3"
+  }
+}

@@ -513,6 +513,52 @@ try {
     throw new Error(`legacy recovery records were deleted without authoritative ACK processing: ${JSON.stringify({ acknowledgedBackfill, ingest: replayedBackfillStatus.ingest })}`);
   }
   const subscriber = await connect("subscribe_live");
+  // Worker live traffic and Window durable traffic arrive on separate
+  // publisher sockets. The durable snapshot must be ACKed without a second
+  // audience broadcast or an implicit historical recovery generation.
+  const workerPublisher = await connect("publish_live");
+  const splitStart = subscriber.messages.length;
+  const splitBackfillBefore = Number((await json("/api/training-csv/status")).ingest?.backfillProcessedPackets || 0);
+  workerPublisher.socket.send(JSON.stringify({
+    type: "live_batch", room: "default", batch: rawPacket(1, false),
+    clientTime: Date.now(), liveOnly: true,
+  }));
+  publisher.socket.send(JSON.stringify({
+    type: "live_batch", room: "default", batch: rawPacket(1, false),
+    clientTime: Date.now(), clientSequence: 1000,
+    packetId: "verify:worker-split", eventId: started.event.id,
+    liveOnly: true, durable: true, persistOnly: true,
+  }));
+  await delay(350);
+  const splitBroadcasts = subscriber.messages.slice(splitStart)
+    .filter((message) => message.type === "live_batch" && !message.snapshot);
+  const splitAck = publisher.messages.find((message) => message.type === "live_packet_ack" && message.packetId === "verify:worker-split");
+  const splitBackfillAfter = Number((await json("/api/training-csv/status")).ingest?.backfillProcessedPackets || 0);
+  if (splitBroadcasts.length !== 1 || !splitAck?.accepted || splitBackfillAfter !== splitBackfillBefore) {
+    throw new Error(`Worker/Window split duplicated live or lost durable ACK: ${JSON.stringify({ splitBroadcasts: splitBroadcasts.length, splitAck, splitBackfillBefore, splitBackfillAfter })}`);
+  }
+  const nativeAudienceStart = subscriber.messages.length;
+  const nativeCoachStart = publisher.messages.length;
+  workerPublisher.socket.send(JSON.stringify({
+    type: "live_batch", room: "default", batch: rawPacket(1, false),
+    clientTime: Date.now(), liveOnly: true, source: "native_collector",
+  }));
+  workerPublisher.socket.send(JSON.stringify({
+    type: "live_batch", room: "default", batch: rawPacket(1, false),
+    clientTime: Date.now(), clientSequence: 1001,
+    packetId: "verify:native-collector", eventId: started.event.id,
+    liveOnly: true, durable: true, persistOnly: true,
+  }));
+  await delay(350);
+  const nativeAudienceFrames = subscriber.messages.slice(nativeAudienceStart)
+    .filter((message) => message.type === "live_batch" && !message.snapshot);
+  const nativeCoachFrames = publisher.messages.slice(nativeCoachStart)
+    .filter((message) => message.type === "live_batch" && message.source === "native_collector");
+  const nativeAck = workerPublisher.messages.find((message) => message.type === "live_packet_ack" && message.packetId === "verify:native-collector");
+  if (nativeAudienceFrames.length !== 1 || nativeCoachFrames.length !== 1 || !nativeAck?.accepted) {
+    throw new Error(`native collector did not feed one audience frame, coach echo, and durable ACK: ${JSON.stringify({ nativeAudienceFrames: nativeAudienceFrames.length, nativeCoachFrames: nativeCoachFrames.length, nativeAck })}`);
+  }
+  workerPublisher.socket.close();
   const orderingMessageStart = subscriber.messages.length;
   const newerLiveClientTime = Date.now();
   publisher.socket.send(JSON.stringify({

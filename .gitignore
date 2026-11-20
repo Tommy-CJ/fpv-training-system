@@ -8,6 +8,11 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+desktop/node_modules/
+desktop/out/
+desktop/shared/
+desktop/.npm-cache/
+desktop/electron-dist/
 dist
 dist-ssr
 *.local
